@@ -54,6 +54,19 @@ sweeping to the end of a page in reading order picks it up. Zotero has the same
 behaviour on the same file, which is a good sign that it is inherent rather
 than a defect here.
 
+The "boxes in the top-left corner" reported earlier are the same mechanism,
+diagnosed on 10 October 2026 with the real-window harness. In the loneliness
+paper they are the publisher's production stamp, "777309 research-article
+2018", printed tiny in page 1's top-left corner and drawn last in the content
+stream, so a selection running off the bottom of page 1 sweeps them in. They
+survive the filter below because they form two lines close to each other, and
+the filter only drops a line that stands alone. Dropping a detached group of
+two would fix this, but would also drop the first two lines of a second column
+in a two-column paper. A narrower test would be text lying entirely in the page
+margin, outside the horizontal span of the body lines, or text drawn at a
+near-zero height (two of the three stamp words are about a pixel tall). The
+harness reports this as a known issue rather than a failure.
+
 `dropRunningHeads()` catches the common case: a line standing far above or
 below everything else selected on that page is dropped. It is deliberately
 timid, because dropping real text would be worse than leaving a page number
