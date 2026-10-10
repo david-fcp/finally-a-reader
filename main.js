@@ -198,9 +198,27 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     this.registerDomEvent(document, 'mouseup', (e) => this.onMouseUp(e));
     this.registerDomEvent(document, 'click', (e) => this.onClick(e), true);
     this.registerDomEvent(document, 'contextmenu', (e) => this.onContextMenu(e), true);
+
+    /* Footnote and endnote previews. Anything that moves the page, or any
+       click outside the preview, puts it away. */
+    this.footnotes = new FootnotePreview(this);
+    this.registerDomEvent(document, 'mouseover', (e) => this.footnotes.over(e));
+    this.registerDomEvent(document, 'mouseout', (e) => this.footnotes.out(e));
+    this.registerDomEvent(document, 'wheel', () => this.footnotes.hide(), { capture: true, passive: true });
+    this.registerDomEvent(
+      document,
+      'keydown',
+      (e) => {
+        /* Not for a modifier on its own: Cmd is the start of Cmd+Z. */
+        if (!['Shift', 'Meta', 'Control', 'Alt'].includes(e.key)) this.footnotes.hide();
+      },
+      true
+    );
+    this.registerDomEvent(document, 'mousedown', (e) => this.footnotes.pressed(e), true);
   }
 
   onunload() {
+    if (this.footnotes) this.footnotes.hide();
     for (const state of this.views.values()) this.syncZoom(state);
     /* Typing still waiting to be saved is saved now rather than dropped. */
     for (const doc of this.docs.values()) {
@@ -1614,6 +1632,173 @@ const QUOTE_LINES = 5;
 const FIELD_SIZING =
   typeof CSS !== 'undefined' && typeof CSS.supports === 'function' && CSS.supports('field-sizing', 'content');
 
+/* Hovering a link to another place in the same PDF, which is what a footnote
+   or endnote marker is, shows a picture of the place it leads to, as Zotero
+   does. A picture rather than extracted text: it shows the note as printed,
+   formulas and italics included, and there is no guessing where one note
+   ends and the next begins. Clicking the preview, or the marker itself, goes
+   there. Only links inside the document; a web link is left to the viewer. */
+class FootnotePreview {
+  constructor(plugin) {
+    this.plugin = plugin;
+    /** The marker being hovered, or whose preview is showing. */
+    this.link = null;
+    this.el = null;
+    this.showTimer = null;
+    this.hideTimer = null;
+    /* Changes whenever a preview is put away or another is asked for, so a
+       picture that finishes rendering after that is dropped, not shown. */
+    this.token = 0;
+    /* Resolved destinations, per document, so hovering again is instant. */
+    this.targets = new WeakMap();
+  }
+
+  over(e) {
+    const t = e.target;
+    if (!(t instanceof Element)) return;
+    if (this.el && this.el.contains(t)) {
+      this.cancelHide();
+      return;
+    }
+    const link = t.closest('.annotationLayer .linkAnnotation a');
+    if (!link) return;
+    if (link === this.link) {
+      this.cancelHide();
+      return;
+    }
+    if (!(link.getAttribute('href') || '').startsWith('#')) return;
+    const hit = this.plugin.locate(e);
+    if (!hit) return;
+    this.hide();
+    this.link = link;
+    const token = this.token;
+    this.showTimer = window.setTimeout(() => {
+      this.showTimer = null;
+      this.show(hit.state, link, token).catch((err) => {
+        this.plugin.report('could not preview the link', err);
+        if (this.link === link) this.hide();
+      });
+    }, FOOTNOTE_DELAY);
+  }
+
+  /* Leaving the marker or the preview for anywhere but the other one. A
+     moment's grace lets the pointer cross the gap between them. */
+  out(e) {
+    if (!this.link) return;
+    const inside = (node) =>
+      node instanceof Node && (this.link.contains(node) || (!!this.el && this.el.contains(node)));
+    if (!inside(e.target) || inside(e.relatedTarget)) return;
+    this.cancelHide();
+    this.hideTimer = window.setTimeout(() => this.hide(), FOOTNOTE_GRACE);
+  }
+
+  pressed(e) {
+    if (this.el && e.target instanceof Node && this.el.contains(e.target)) return;
+    this.hide();
+  }
+
+  cancelHide() {
+    if (this.hideTimer) window.clearTimeout(this.hideTimer);
+    this.hideTimer = null;
+  }
+
+  hide() {
+    if (this.showTimer) window.clearTimeout(this.showTimer);
+    this.showTimer = null;
+    this.cancelHide();
+    if (this.el) this.el.remove();
+    this.el = null;
+    this.link = null;
+    this.token++;
+  }
+
+  async show(state, link, token) {
+    const inner = pdfInnerOf(state.view);
+    const pdf = inner && inner.pdfDocument;
+    const pageEl = link.closest('.page');
+    const section = link.closest('[data-annotation-id]');
+    if (!pdf || !pageEl || !section) return;
+    const target = await this.resolve(pdf, pageNumberOf(pageEl), section.dataset.annotationId);
+    /* Moved on while that was being worked out. */
+    if (!target || this.token !== token) return;
+    const win = link.ownerDocument.defaultView || window;
+    const width = Math.min(FOOTNOTE_WIDTH, win.innerWidth - 2 * BOX_MARGIN);
+    const picture = await this.render(pdf, target, width, win.devicePixelRatio || 1);
+    if (!picture || this.token !== token) return;
+    if (this.el) this.el.remove();
+
+    const el = link.ownerDocument.body.createDiv({ cls: 'mpa-footnote' });
+    el.appendChild(picture);
+    el.addEventListener('click', () => {
+      if (inner.linkService) inner.linkService.goToDestination(target.dest);
+      this.hide();
+    });
+    const r = link.getBoundingClientRect();
+    const at = placeBox(
+      { left: r.left, top: r.top, bottom: r.bottom },
+      { width: el.offsetWidth, height: el.offsetHeight },
+      { width: win.innerWidth, height: win.innerHeight }
+    );
+    el.style.left = `${at.left}px`;
+    el.style.top = `${at.top}px`;
+    this.el = el;
+  }
+
+  /* The page and point a link leads to. */
+  resolve(pdf, pageNumber, annotationId) {
+    let cache = this.targets.get(pdf);
+    if (!cache) this.targets.set(pdf, (cache = new Map()));
+    const key = `${pageNumber}:${annotationId}`;
+    if (!cache.has(key)) {
+      const found = (async () => {
+        const page = await pdf.getPage(pageNumber);
+        const link = (await page.getAnnotations()).find((a) => a.id === annotationId);
+        if (!link || !link.dest) return null;
+        const explicit = typeof link.dest === 'string' ? await pdf.getDestination(link.dest) : link.dest;
+        if (!Array.isArray(explicit) || !explicit.length) return null;
+        const ref = explicit[0];
+        const pageIndex = typeof ref === 'number' ? ref : await pdf.getPageIndex(ref);
+        return { dest: link.dest, pageIndex, point: destPoint(explicit) };
+      })();
+      /* A failure is not remembered: the next hover tries again. */
+      found.catch(() => cache.delete(key));
+      cache.set(key, found);
+    }
+    return cache.get(key);
+  }
+
+  /* A picture of the region the link leads to, across the text column, as
+     wide as the preview. */
+  async render(pdf, target, width, ratio) {
+    const page = await pdf.getPage(target.pageIndex + 1);
+    /* A page turned on its side has its text column running down the
+       screen, which this way of cutting out a region does not handle. Such
+       a marker still jumps when clicked. */
+    if (page.rotate % 180) return null;
+    const text = await page.getTextContent();
+    const region = footnoteRegion(text.items, page.view, target.point, width / FOOTNOTE_MAX_SCALE);
+    const scale = (width / (region.right - region.left)) * ratio;
+    const viewport = page.getViewport({ scale });
+    const [x0, y0] = viewport.convertToViewportPoint(region.left, region.top);
+    const [x1, y1] = viewport.convertToViewportPoint(region.right, region.bottom);
+    const left = Math.min(x0, x1);
+    const top = Math.min(y0, y1);
+    const canvas = createEl('canvas', { cls: 'mpa-footnote-picture' });
+    canvas.width = Math.max(1, Math.ceil(Math.abs(x1 - x0)));
+    canvas.height = Math.max(1, Math.ceil(Math.abs(y1 - y0)));
+    canvas.style.width = `${canvas.width / ratio}px`;
+    canvas.style.height = `${canvas.height / ratio}px`;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    await page.render({ canvasContext: ctx, viewport, transform: [1, 0, 0, 1, -left, -top] }).promise;
+    /* For screen readers, and for anyone checking what is shown. */
+    canvas.setAttr('role', 'img');
+    canvas.setAttr('aria-label', region.text);
+    return canvas;
+  }
+}
+
 class AnnotationsView extends ItemView {
   constructor(leaf, plugin) {
     super(leaf);
@@ -2093,6 +2278,17 @@ function uuid() {
 /* Keeps a box inside the window, with a margin. Shared by the opening
    placement and by dragging, so a box cannot be left somewhere it cannot be
    reached. */
+/* The footnote preview: how long the pointer rests on a marker before it
+   appears, how long it may be away before it goes, how wide it is, and how
+   much of the page, in PDF points, it shows below the place linked to. */
+const FOOTNOTE_DELAY = 250;
+const FOOTNOTE_GRACE = 250;
+const FOOTNOTE_WIDTH = 440;
+const FOOTNOTE_DEPTH = 110;
+/* No more than this many screen pixels to a PDF point, so a narrow column
+   of text is not blown up to fill the preview. */
+const FOOTNOTE_MAX_SCALE = 1.5;
+
 const BOX_MARGIN = 8;
 const BOX_GAP = 6;
 
@@ -2775,6 +2971,80 @@ function markFlash(el, state, id) {
 
 /* The PDF.js viewer behind a PDF view, without the zoom check pdfViewerOf
    makes: navigation needs the viewer even before a zoom has been set. */
+/* Where an explicit destination points, in PDF units, y measured up from the
+   bottom of the page. Either can be missing: "the top of the page" or "the
+   left edge as it is". */
+function destPoint(explicit) {
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  const kind = explicit && explicit[1] && explicit[1].name;
+  switch (kind) {
+    case 'XYZ':
+      return { x: num(explicit[2]), y: num(explicit[3]) };
+    case 'FitH':
+    case 'FitBH':
+      return { x: null, y: num(explicit[2]) };
+    case 'FitV':
+    case 'FitBV':
+      return { x: num(explicit[2]), y: null };
+    case 'FitR':
+      return { x: num(explicit[2]), y: num(explicit[5]) };
+    default:
+      return { x: null, y: null };
+  }
+}
+
+/* The part of a page a footnote preview shows: the text column's width,
+   from the top of the line the link points at down FOOTNOTE_DEPTH points,
+   or to the last line of text before that.
+
+   Some PDFs point at the top of the note's first line and some at its
+   baseline, so the line is found from the page's text rather than trusted:
+   a line whose baseline is at the point, or just under it, is that line.
+   Also returns the words in the region, for a screen reader. */
+function footnoteRegion(items, view, point, minWidth) {
+  const [vx0, vy0, vx1, vy1] = view;
+  const lines = (items || []).filter(
+    (it) =>
+      typeof it.str === 'string' &&
+      it.str.trim() &&
+      Array.isArray(it.transform) &&
+      Number.isFinite(it.transform[4]) &&
+      Number.isFinite(it.transform[5])
+  );
+
+  let left = vx0;
+  let right = vx1;
+  if (lines.length) {
+    left = Math.max(vx0, Math.min(...lines.map((it) => it.transform[4])) - 4);
+    right = Math.min(vx1, Math.max(...lines.map((it) => it.transform[4] + (it.width || 0))) + 4);
+    if (right - left < 20) [left, right] = [vx0, vx1];
+  }
+  /* A narrow column is widened rather than magnified. */
+  const narrowest = Math.min(minWidth || 0, vx1 - vx0);
+  if (right - left < narrowest) {
+    right = Math.min(vx1, left + narrowest);
+    left = Math.max(vx0, right - narrowest);
+  }
+
+  const y = point && point.y !== null && point.y !== undefined ? point.y : vy1;
+  const at = lines.filter((it) => it.transform[5] <= y + 2 && it.transform[5] >= y - 14);
+  let top = at.length ? Math.max(...at.map((it) => it.transform[5] + (it.height || 10))) + 2 : y + 2;
+  top = Math.min(Math.max(top, vy0 + 1), vy1);
+  let bottom = Math.max(top - FOOTNOTE_DEPTH, vy0);
+  /* No further down than the last line in reach, so a short note gets a
+     short preview. Its descenders are kept. */
+  const shown = lines.filter((it) => it.transform[5] <= top && it.transform[5] >= bottom);
+  if (shown.length) bottom = Math.max(bottom, Math.min(...shown.map((it) => it.transform[5])) - 4);
+
+  const text = shown
+    .sort((a, b) => b.transform[5] - a.transform[5] || a.transform[4] - b.transform[4])
+    .map((it) => it.str)
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return { left, right, top, bottom, text };
+}
+
 function pdfInnerOf(view) {
   const child = view && view.viewer && view.viewer.child;
   const wrapper = child && child.pdfViewer;

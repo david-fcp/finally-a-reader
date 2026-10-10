@@ -70,7 +70,7 @@ m._compile(
     "indexOfBoundary,touchedBounds,refineBoundary,nearestPointer,isWordChar,insideWord," +
     "snapStart,snapEnd,selectedSlice,linesFromChars,textOfChars,snapshot,NoteHistory," +
     "annotationItems,compareOrder,findAnnotation,annotationTarget,flashing,flashElapsed,pdfInnerOf,AnnotationsView," +
-    "searchWords,wordMatches,editDistance,matchesQuery," +
+    "searchWords,wordMatches,editDistance,matchesQuery,destPoint,footnoteRegion," +
     "validZoom,pdfViewerOf,pruneZooms,placeBox,clampToViewport};\n",
   P
 );
@@ -1874,6 +1874,43 @@ console.log("\n--- clampToViewport");
       await plugin.setSidebarSort("nonsense");
       eq("anything unknown means reading order", plugin.settings.sidebarSort, "position");
     }
+  }
+
+  console.log("\n--- footnote previews");
+  {
+    eq("XYZ gives a point", T.destPoint([{ num: 1 }, { name: "XYZ" }, 72, 112, null]), { x: 72, y: 112 });
+    eq("a missing coordinate is left open", T.destPoint([{ num: 1 }, { name: "XYZ" }, null, 500, 0]), { x: null, y: 500 });
+    eq("FitH gives only a height", T.destPoint([0, { name: "FitH" }, 300]), { x: null, y: 300 });
+    eq("FitR gives its top-left corner", T.destPoint([0, { name: "FitR" }, 10, 20, 30, 40]), { x: 10, y: 40 });
+    eq("Fit means the top of the page", T.destPoint([0, { name: "Fit" }]), { x: null, y: null });
+    eq("nonsense is the top of the page too", T.destPoint(null), { x: null, y: null });
+
+    const item = (str, x, y, width = 200, height = 9) => ({ str, transform: [height, 0, 0, height, x, y], width, height });
+    const view = [0, 0, 612, 792];
+    const page = [
+      item("Body text across the column", 72, 600, 468, 12),
+      item("1 The footnote text.", 72, 100),
+      item("Lower down.", 72, 88),
+    ];
+    const atTop = T.footnoteRegion(page, view, { x: 72, y: 112 });
+    eq("pointed at the top of the line: the line is shown whole", atTop.top, 111);
+    eq("across the text column, with a little room", [atTop.left, atTop.right], [68, 544]);
+    eq("down to the last line in reach, keeping its descenders", atTop.bottom, 84);
+    eq("and its words are read out", atTop.text, "1 The footnote text. Lower down.");
+    const atBaseline = T.footnoteRegion(page, view, { x: 72, y: 100 });
+    eq("pointed at the baseline: the same line, not the one below", atBaseline.top, 111);
+    const nowhere = T.footnoteRegion(page, view, { x: null, y: null });
+    eq("no point: the top of the page", nowhere.top, 792);
+    eq("and only as far as the preview reaches", nowhere.bottom, 792 - 110);
+    eq("which here holds no words", nowhere.text, "");
+    const narrow = T.footnoteRegion([item("2. A note.", 72, 690, 150)], view, { x: 72, y: 704 }, 300);
+    eq("a narrow column is widened, not magnified", narrow.right - narrow.left, 300);
+    eq("from where the text starts", narrow.left, 68);
+    const blank = T.footnoteRegion([], view, { x: null, y: 400 });
+    eq("a page with no text is shown across its width", [blank.left, blank.right], [0, 612]);
+    eq("down the full depth", blank.top - blank.bottom, 110);
+    const below = T.footnoteRegion([], view, { x: null, y: -50 });
+    eq("a point below the page is kept on it", below.top > below.bottom && below.bottom === 0, true);
   }
 
   console.log(`\n${pass} passed, ${fail} failed`);
