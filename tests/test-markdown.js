@@ -72,6 +72,7 @@ m._compile(
     "indexOfBoundary,touchedBounds,refineBoundary,nearestPointer,isWordChar,insideWord," +
     "snapStart,snapEnd,selectedSlice,linesFromChars,textOfChars,snapshot,NoteHistory," +
     "annotationItems,compareOrder,findAnnotation,annotationTarget,flashing,flashElapsed,pdfInnerOf,AnnotationsView," +
+    "searchWords,wordMatches,editDistance,matchesQuery," +
     "validZoom,pdfViewerOf,pruneZooms,placeBox,clampToViewport};\n",
   P
 );
@@ -1883,6 +1884,45 @@ console.log("\n--- clampToViewport");
     eq("partway through, it knows how far", elapsed >= 400 && elapsed < 1000, true);
     eq("another annotation is not flashing", T.flashElapsed(state, "b"), null);
     eq("nor is anything once it is over", T.flashElapsed({ flash: { id: "a", since: 0, until: 1 } }, "a"), null);
+  }
+
+  console.log("\n--- searching annotations");
+  {
+    const q = (text, query) => T.matchesQuery(text, query);
+    eq("nothing typed matches everything", q("anything", "  "), true);
+    eq("a word in the quote", q("The loneliness of the long-distance runner", "loneliness"), true);
+    eq("case and accents are ignored", q("Café society", "CAFE"), true);
+    eq("part of a word", q("communitarian", "commun"), true);
+    eq("every word typed must be found", q("long-distance runner", "runner long"), true);
+    eq("not just some of them", q("long-distance runner", "runner swimmer"), false);
+    eq("a letter missed", q("loneliness", "lonliness"), true);
+    eq("two letters swapped", q("manifesto", "mainfesto"), true);
+    eq("a word typed partway, with a slip", q("localism", "lcoal"), true);
+    eq("short words must be exact", q("the cat sat", "cot"), false);
+    eq("too many slips is no match", q("loneliness", "lxnxlxness"), false);
+    eq("letters scattered across a passage are no match", q("a big long sentence about nothing in particular", "bloat"), false);
+    eq("the note is searched too", q("quoted words\nmy own thought", "thought"), true);
+    eq("punctuation does not get in the way", q("“Hello,” she said.", "hello said"), true);
+    eq("numbers count as words", q("in 1984 they", "1984"), true);
+    eq("an edit distance gives up past its limit", T.editDistance("abcdef", "uvwxyz", 2), 3);
+    eq("and counts exactly within it", T.editDistance("kitten", "sitten", 2), 1);
+  }
+
+  console.log("\n--- changing the sidebar's order");
+  {
+    let refreshed = 0, buttons = 0, saved = null;
+    const plugin = Object.create(PluginClass.prototype);
+    plugin.settings = { sidebarSort: "position" };
+    plugin.saveData = async (d) => { saved = d.sidebarSort; };
+    plugin.sidebars = () => [{ refresh: () => refreshed++, updateSortButton: () => buttons++ }];
+    {
+      await plugin.setSidebarSort("date");
+      eq("the order is changed", plugin.settings.sidebarSort, "date");
+      eq("and kept for next time", saved, "date");
+      eq("and the sidebar redrawn", [refreshed, buttons], [1, 1]);
+      await plugin.setSidebarSort("nonsense");
+      eq("anything unknown means reading order", plugin.settings.sidebarSort, "position");
+    }
   }
 
   console.log(`\n${pass} passed, ${fail} failed`);

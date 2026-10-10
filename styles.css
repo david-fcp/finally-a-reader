@@ -99,6 +99,36 @@ body.mpa-mode-active .textLayer {
   padding: var(--size-4-2);
 }
 
+/* Stays in view as the list scrolls under it. */
+.mpa-sidebar-header {
+  position: sticky;
+  top: calc(-1 * var(--size-4-2));
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: var(--size-4-1);
+  margin: calc(-1 * var(--size-4-2)) calc(-1 * var(--size-4-2)) 0;
+  padding: var(--size-4-2);
+  background: var(--background-secondary);
+}
+
+.mpa-search {
+  flex: 1;
+  min-width: 0;
+}
+
+.mpa-search input {
+  width: 100%;
+}
+
+.mpa-sort {
+  flex: none;
+}
+
+.mpa-card.mpa-hidden {
+  display: none;
+}
+
 .mpa-sidebar-list {
   display: flex;
   flex-direction: column;
@@ -139,9 +169,12 @@ body.mpa-mode-active .textLayer {
 /* The highlighted words, with the highlight's own colour as a bar beside
    them, as Zotero shows them. The note underneath runs the full width, so the
    words and the note never look alike. */
-.mpa-card-quote {
+.mpa-card-words {
   flex: 1;
   min-width: 0;
+}
+
+.mpa-card-quote {
   padding-left: var(--size-4-2);
   border-left: 3px solid var(--mpa-color, #ffeb3b);
   font-size: var(--font-ui-small);
@@ -153,6 +186,30 @@ body.mpa-mode-active .textLayer {
 }
 
 .mpa-card-quote:hover {
+  color: var(--text-accent);
+}
+
+/* A long quote shows five lines, the last fading out, until it is clicked. */
+.mpa-card.is-long:not(.is-expanded) .mpa-card-quote {
+  max-height: calc(5lh);
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 1lh), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 1lh), transparent);
+}
+
+.mpa-card-less {
+  display: none;
+  padding-left: calc(var(--size-4-2) + 3px);
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.mpa-card.is-long.is-expanded .mpa-card-less {
+  display: block;
+}
+
+.mpa-card-less:hover {
   color: var(--text-accent);
 }
 

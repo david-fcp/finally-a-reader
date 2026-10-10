@@ -1382,6 +1382,15 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     this.settings.rememberZoom = this.settings.rememberZoom !== false;
   }
 
+  async setSidebarSort(sort) {
+    this.settings.sidebarSort = sort === 'date' ? 'date' : 'position';
+    await this.saveData(this.settings);
+    for (const sidebar of this.sidebars()) {
+      sidebar.updateSortButton();
+      sidebar.refresh();
+    }
+  }
+
   async saveSettings() {
     await this.saveData(this.settings);
     this.applyModeColor();
@@ -1560,6 +1569,9 @@ class MinimalPdfAnnotatorSettingTab extends PluginSettingTab {
 
 /* Whether the browser can grow a text box to fit its contents by itself. Where
    it cannot, the sidebar does it by measuring. */
+/* How many lines of a highlight's words a card shows before cutting them. */
+const QUOTE_LINES = 5;
+
 const FIELD_SIZING =
   typeof CSS !== 'undefined' && typeof CSS.supports === 'function' && CSS.supports('field-sizing', 'content');
 
@@ -1572,6 +1584,7 @@ class AnnotationsView extends ItemView {
     /** @type {Map<string, Card>} */
     this.cards = new Map();
     this.selectedId = null;
+    this.query = '';
   }
 
   getViewType() {
@@ -1590,15 +1603,153 @@ class AnnotationsView extends ItemView {
     const root = this.contentEl;
     root.empty();
     root.addClass('mpa-sidebar');
+    this.buildHeader(root.createDiv({ cls: 'mpa-sidebar-header' }));
     this.listEl = root.createDiv({ cls: 'mpa-sidebar-list' });
     this.emptyEl = root.createDiv({ cls: 'mpa-sidebar-empty' });
+    /* Quotes are measured again whenever the list changes width, including
+       when a folded-away sidebar is opened out, which onResize alone may not
+       report. */
+    this.resizeObserver = new ResizeObserver(() => this.measureQuotes([...this.cards.values()]));
+    this.resizeObserver.observe(this.listEl);
+    /* A mouse button held down in the sidebar: a search is not reapplied
+       until it is let go, so a card cannot vanish between press and click. */
+    this.pressing = false;
+    this.registerDomEvent(root, 'pointerdown', () => (this.pressing = true), { capture: true });
+    this.registerDomEvent(window, 'pointerup', () => {
+      if (!this.pressing) return;
+      this.pressing = false;
+      if (this.refilterPending) setTimeout(() => this.applyFilter(), 0);
+      this.refilterPending = false;
+    });
     this.doc = undefined;
     this.setDoc(this.plugin.focusDoc());
   }
 
   async onClose() {
+    if (this.resizeObserver) this.resizeObserver.disconnect();
     this.cards.clear();
     this.listEl = null;
+  }
+
+  /* The sidebar's width changed, or it was shown: a quote fills a different
+     number of lines than it did. */
+  onResize() {
+    this.measureQuotes([...this.cards.values()]);
+  }
+
+  buildHeader(header) {
+    const box = header.createDiv({ cls: 'search-input-container mpa-search' });
+    const input = (this.searchEl = box.createEl('input', {
+      type: 'search',
+      attr: { placeholder: 'Search annotations', spellcheck: 'false', enterkeyhint: 'search' },
+    }));
+    const clear = (this.searchClearEl = box.createDiv({
+      cls: 'search-input-clear-button',
+      attr: { 'aria-label': 'Clear search' },
+    }));
+    clear.hide();
+    input.addEventListener('input', () => this.setQuery(input.value));
+    input.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape' || !input.value) return;
+      e.preventDefault();
+      e.stopPropagation();
+      this.clearSearch();
+    });
+    clear.addEventListener('click', () => {
+      this.clearSearch();
+      input.focus();
+    });
+
+    this.sortEl = header.createDiv({ cls: 'clickable-icon mpa-sort' });
+    this.sortEl.addEventListener('click', () => {
+      this.plugin.setSidebarSort(this.plugin.settings.sidebarSort === 'date' ? 'position' : 'date');
+    });
+    this.updateSortButton();
+  }
+
+  updateSortButton() {
+    if (!this.sortEl) return;
+    const byDate = this.plugin.settings.sidebarSort === 'date';
+    setIcon(this.sortEl, byDate ? 'clock' : 'list-ordered');
+    this.sortEl.setAttr(
+      'aria-label',
+      byDate
+        ? 'In the order they were added. Click to list them in the order they appear.'
+        : 'In the order they appear. Click to list them in the order they were added.'
+    );
+  }
+
+  setQuery(query) {
+    this.query = query;
+    if (this.searchEl && this.searchEl.value !== query) this.searchEl.value = query;
+    if (this.searchClearEl) this.searchClearEl.toggle(!!query);
+    this.applyFilter();
+  }
+
+  clearSearch() {
+    this.setQuery('');
+  }
+
+  searching() {
+    return searchWords(this.query).length > 0;
+  }
+
+  /* Hides the cards that do not match the search. A card whose note is being
+     typed in stays, even if what is typed stops it matching: it would
+     otherwise vanish under the cursor. */
+  applyFilter() {
+    if (!this.listEl) return;
+    const query = this.query;
+    let shown = 0;
+    for (const card of this.cards.values()) {
+      const keep =
+        !this.searching() ||
+        document.activeElement === card.note ||
+        matchesQuery(`${card.quoteText || ''}\n${card.note.value}`, query);
+      card.el.toggleClass('mpa-hidden', !keep);
+      if (keep) shown++;
+    }
+    /* Cards hidden when their quote last changed, or when the width did,
+       could not be measured then. */
+    this.measureQuotes([...this.cards.values()].filter((card) => card.unmeasured));
+    const empty = !this.doc || !this.cards.size || !shown;
+    this.emptyEl.toggle(empty);
+    this.emptyEl.setText(
+      !this.doc
+        ? 'Open a PDF to see its annotations here.'
+        : !this.cards.size
+          ? 'No annotations yet. Turn on highlight mode and select some text.'
+          : 'No annotations match.'
+    );
+  }
+
+  /* Marks the quotes too long for five lines, which are cut there until
+     clicked. Measured all at once, then marked, so the page is laid out once
+     rather than once per card. A sidebar that is not on screen has nothing
+     to measure; it is measured when it is shown. */
+  measureQuotes(cards) {
+    const found = [];
+    for (const card of cards) {
+      const quote = card.quote;
+      if (!quote) continue;
+      const line = quote.isConnected && quote.clientWidth ? parseFloat(getComputedStyle(quote).lineHeight) || 0 : 0;
+      if (!line) {
+        card.unmeasured = true;
+        continue;
+      }
+      found.push([card, quote.scrollHeight > line * QUOTE_LINES + 1]);
+    }
+    for (const [card, long] of found) {
+      card.unmeasured = false;
+      card.long = long;
+      card.el.toggleClass('is-long', long);
+      card.el.toggleClass('is-expanded', long && !!card.expanded);
+    }
+  }
+
+  setExpanded(card, expanded) {
+    card.expanded = expanded;
+    card.el.toggleClass('is-expanded', !!card.long && expanded);
   }
 
   /* Shows a different document, or refreshes the one already shown. */
@@ -1615,6 +1766,10 @@ class AnnotationsView extends ItemView {
     if (this.doc && this.doc.editing) this.plugin.endNoteEdit(this.doc);
     this.doc = doc;
     this.selectedId = null;
+    /* A search was for the document being left. */
+    this.query = '';
+    if (this.searchEl) this.searchEl.value = '';
+    if (this.searchClearEl) this.searchClearEl.hide();
     this.listEl.empty();
     this.cards.clear();
     this.refresh();
@@ -1630,14 +1785,6 @@ class AnnotationsView extends ItemView {
   refresh() {
     if (!this.listEl) return;
     const items = this.items();
-
-    this.emptyEl.toggle(!this.doc || !items.length);
-    this.emptyEl.setText(
-      !this.doc
-        ? 'Open a PDF to see its annotations here.'
-        : 'No annotations yet. Turn on highlight mode and select some text.'
-    );
-
     const wanted = new Set(items.map((item) => item.id));
     for (const [id, card] of this.cards) {
       if (wanted.has(id)) continue;
@@ -1646,6 +1793,7 @@ class AnnotationsView extends ItemView {
     }
 
     let previous = null;
+    const changed = [];
     for (const item of items) {
       let card = this.cards.get(item.id);
       const fresh = !card;
@@ -1657,10 +1805,12 @@ class AnnotationsView extends ItemView {
          of anything inside it. */
       const slot = previous ? previous.el.nextSibling : this.listEl.firstChild;
       if (card.el !== slot) this.listEl.insertBefore(card.el, slot);
-      this.updateCard(card, item);
+      if (this.updateCard(card, item) || fresh) changed.push(card);
       if (fresh) this.fit(card.note);
       previous = card;
     }
+    this.measureQuotes(changed);
+    this.applyFilter();
   }
 
   buildCard(item) {
@@ -1674,8 +1824,11 @@ class AnnotationsView extends ItemView {
 
     const head = el.createDiv({ cls: 'mpa-card-head' });
     if (item.kind === 'highlight') {
-      card.quote = head.createDiv({ cls: 'mpa-card-quote' });
+      const words = head.createDiv({ cls: 'mpa-card-words' });
+      card.quote = words.createDiv({ cls: 'mpa-card-quote' });
       card.quote.addEventListener('click', () => this.activate(card));
+      const less = words.createDiv({ cls: 'mpa-card-less', text: 'Show less' });
+      less.addEventListener('click', () => this.setExpanded(card, false));
     } else {
       /* A note of its own has no words to click, so its header does the same
          job: it takes you to where the note was put. */
@@ -1717,9 +1870,14 @@ class AnnotationsView extends ItemView {
     card.el.style.setProperty('--mpa-color', color);
     card.el.toggleClass('is-selected', this.selectedId === card.id);
 
+    let quoteChanged = false;
     if (card.quote) {
       const text = collapseWhitespace(item.obj.text || '');
-      if (card.quote.textContent !== text) card.quote.setText(text);
+      card.quoteText = text;
+      if (card.quote.textContent !== text) {
+        card.quote.setText(text);
+        quoteChanged = true;
+      }
     }
 
     /* A note being typed is left alone: what is in the box is newer than
@@ -1730,6 +1888,7 @@ class AnnotationsView extends ItemView {
       this.fit(card.note);
     }
     card.note.readOnly = !!(this.doc && this.doc.readOnly);
+    return quoteChanged;
   }
 
   /* A note box saves as it is typed in, as Zotero's does, with no button.
@@ -1747,6 +1906,13 @@ class AnnotationsView extends ItemView {
       plugin.setNote(doc, card.id, field.value);
       this.fit(field);
     };
+    /* Leaving a box whose note no longer matches the search hides it then,
+       not while it is being typed in. */
+    field.addEventListener('blur', () => {
+      if (!this.searching()) return;
+      if (this.pressing) this.refilterPending = true;
+      else setTimeout(() => this.applyFilter(), 0);
+    });
     field.addEventListener('focus', () => {
       plugin.noteFields.set(field, { history: new NoteHistory(field), sync });
       this.select(card.id);
@@ -1777,8 +1943,20 @@ class AnnotationsView extends ItemView {
     field.style.setProperty('--mpa-note-height', `${field.scrollHeight}px`);
   }
 
-  /* Clicking a card's words. */
+  /* Clicking a card's words. In a search's results, that finds the card in
+     the whole list; a long quote cut short opens out; otherwise it goes to
+     the place in the document. */
   activate(card) {
+    if (this.searching()) {
+      this.clearSearch();
+      this.showCard(card.id, { block: 'center' });
+      return;
+    }
+    if (card.long && !card.expanded) {
+      this.select(card.id);
+      this.setExpanded(card, true);
+      return;
+    }
     this.select(card.id);
     this.plugin.navigateTo(card.doc, card.id);
   }
@@ -1810,8 +1988,10 @@ class AnnotationsView extends ItemView {
     this.refresh();
     const card = this.cards.get(id);
     if (!card) return;
+    /* Something pointed to from the page is not left hidden by a search. */
+    if (card.el.hasClass('mpa-hidden')) this.clearSearch();
     if (opts.select !== false) this.select(id);
-    card.el.scrollIntoView({ block: 'nearest' });
+    card.el.scrollIntoView({ block: opts.block || 'nearest' });
     card.el.removeClass('mpa-flash');
     void card.el.offsetWidth;
     card.el.addClass('mpa-flash');
@@ -2435,6 +2615,65 @@ function annotationItems(data, sort) {
   const byPosition = (a, b) => compareOrder(a.order, b.order);
   const byDate = (a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : byPosition(a, b));
   return items.sort(sort === 'date' ? byDate : byPosition);
+}
+
+/* Searching annotations. Fuzzy, but word by word: every word typed has to
+   be found in some word of the annotation, as part of it or with a slip or
+   two (a letter missed, added, changed or swapped; one for words of four to
+   six letters, two for longer ones; none for three letters or fewer).
+   Matching letters scattered anywhere across a long passage, as fuzzy
+   finders for file names do, would let almost any short search match every
+   highlight. Accents and case are ignored. */
+function searchWords(text) {
+  return (
+    String(text || '')
+      .normalize('NFKD')
+      .replace(/\p{M}/gu, '')
+      .toLowerCase()
+      .match(/[\p{L}\p{N}]+/gu) || []
+  );
+}
+
+function wordMatches(typed, word) {
+  if (word.includes(typed)) return true;
+  const slips = typed.length <= 3 ? 0 : typed.length <= 6 ? 1 : 2;
+  if (!slips) return false;
+  /* Against the start of the word, so a word typed partway still matches. */
+  for (let len = typed.length - slips; len <= typed.length + slips; len++) {
+    if (len < 1 || len > word.length) continue;
+    if (editDistance(typed, word.slice(0, len), slips) <= slips) return true;
+  }
+  return false;
+}
+
+/* Edits between two words, counting a swap of neighbouring letters as one.
+   Gives up, returning more than `limit`, as soon as that is certain. */
+function editDistance(a, b, limit) {
+  if (Math.abs(a.length - b.length) > limit) return limit + 1;
+  let prev2 = null;
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const row = [i];
+    let best = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      let d = Math.min(prev[j] + 1, row[j - 1] + 1, prev[j - 1] + cost);
+      if (prev2 && i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) d = Math.min(d, prev2[j - 2] + 1);
+      row.push(d);
+      if (d < best) best = d;
+    }
+    if (best > limit) return limit + 1;
+    prev2 = prev;
+    prev = row;
+  }
+  return prev[b.length];
+}
+
+function matchesQuery(text, query) {
+  const typed = searchWords(query);
+  if (!typed.length) return true;
+  const words = searchWords(text);
+  return typed.every((t) => words.some((w) => wordMatches(t, w)));
 }
 
 function compareOrder(a, b) {
