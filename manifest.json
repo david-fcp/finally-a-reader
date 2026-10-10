@@ -3,7 +3,7 @@
   "name": "Minimal PDF annotator",
   "version": "0.1.0",
   "minAppVersion": "1.5.0",
-  "description": "Highlight text in PDFs and add notes. Highlights are stored beside the PDF and collected into a matching markdown file.",
+  "description": "Highlight and annotate PDFs and EPUBs with a Zotero-like sidebar, and turn the annotations into a markdown note in one click.",
   "author": "david-fcp",
   "authorUrl": "https://github.com/david-fcp",
   "isDesktopOnly": false

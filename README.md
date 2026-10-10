@@ -1,189 +1,168 @@
 # Minimal PDF annotator
 
-Highlight text in a PDF, attach notes to the highlights, and get a markdown
-transcript of them beside the PDF.
+[PDF++](https://github.com/RyotaUshio/obsidian-pdf-plus) has the most features
+of Obsidian readers, but is busy and clunky for some workflows.
+[Zotero](https://www.zotero.org/) might be the best annotation and study app,
+but maybe you want to keep everything in Obsidian.
 
-Deliberately small. There is one colour, one kind of highlight and one kind of
-note. If you want stamps, drawing tools, a sidebar of annotation cards or
-two-way sync between the PDF and a note, this is the wrong plugin and
-[PDF++](https://github.com/RyotaUshio/obsidian-pdf-plus) is probably the right
-one.
+This plugin suits anyone who wants to highlight and add notes to a PDF or EPUB
+file, have those annotations appear in an interactive sidebar (like in Zotero),
+and then be able to instantly generate a markdown file containing all of those
+notes.
+
+For me, this replaces Zotero and Zotero-like plugins. Enjoy!
 
 ## Using it
 
-1. Turn on highlight mode. Three equivalent controls: the highlighter icon in
-   the ribbon, the swatch in the status bar, or the highlighter button added to
-   the PDF viewer's own toolbar. There is also a command, **Toggle highlight
-   mode**, if you would rather bind a key.
-2. Select text in a PDF. It is highlighted as soon as you release the mouse.
-3. **Click a highlight** to attach a note to it.
-4. **Right-click a highlight** to add or edit its note, or to remove either.
-   Right-click a blank part of a page for "Add note", which anchors a note of
-   its own at that point.
+1. **Turn on highlight mode.** Use the highlighter icon in the ribbon, the
+   swatch in the status bar, the highlighter button in a PDF's toolbar or at
+   the top of a book, or the command **Toggle highlight mode**.
+2. **Select text** in a PDF or an EPUB. It is highlighted as soon as you let
+   go of the mouse, and appears in the sidebar.
+3. **Add a note** by typing in the "Add note" box under a highlight in the
+   sidebar. Notes save as you type.
 
-In a note box, Cmd or Ctrl with Enter saves, and Esc discards. Clicking away
-saves.
+The sidebar opens by itself the first time you open a PDF or EPUB. The command
+**Open annotations sidebar** brings it back.
 
-Highlights record the colour they were made with, so changing the colour in
-settings affects new highlights and leaves existing ones as they are.
+### Getting around
 
-Highlights are cut from a single array of characters, each measured on the
-page, so the text transcribed and the rectangles drawn are two slices of the
-same thing and cannot disagree about a character. This matters more than it
-sounds: a PDF viewer stretches each span of text horizontally to match the
-document's own letter spacing, and the browser picks a character boundary using
-the unstretched metrics, so its answer can sit a glyph away from where your
-pointer was. Where a drag ends between two letters, the one nearer the pointer
-wins. Unless you turn it off in the settings, the boundary then widens to the
-whole word, and a boundary already between two words is never moved.
+- **Click a highlight in the document** to land in its note box in the
+  sidebar.
+- **Click a highlight's words in the sidebar** to go to it in the document.
+- **Right-click a bare part of the text** for "Add note", which makes a note of
+  its own at that point.
+- **Delete** a highlight or note from the ··· menu on its card, or select the
+  card and press Delete. Right-clicking a highlight in the document offers the
+  same.
+- **Hover over a footnote or endnote marker** to read the note without
+  leaving your place. Click the marker, or the preview, to jump to it. This
+  works for any link to somewhere else in the same document.
 
-A selection that runs across a page break is one highlight, not two, so
-removing it removes the whole thing. Such a selection also takes in whatever
-sits between the two columns of body text, usually a running header or a page
-number, and a PDF may draw those at any point in its content stream rather than
-where they appear. A line standing on its own, far above or below everything
-else selected on that page, is treated as one of them and left out. At most two
-lines from either extreme, and only for a gap wider than any paragraph break,
-so a two-column paper is unaffected.
+Every note is marked by a small icon in the left margin, level with what it
+belongs to, so it never covers the text.
 
-Every note, whether it belongs to a highlight or stands on its own, is marked
-by a small icon in the page's left margin, level with the thing it refers to.
-They never sit over the text, and they line up in a column down the page. How
-far in they sit is a CSS variable, `--mpa-margin-inset`, so a snippet can move
-them without touching the plugin. Where a standalone note was anchored is still
-recorded and still decides its place in the transcript; only the marker is in
-the margin.
+### The sidebar
 
-A note box opens below everything the note belongs to, clearing the last line
-of a highlight rather than only its first, so the words stay readable while you
-write. Drag the strip along its top to move it. It keeps itself inside the
-window either way, flipping above its anchor when there is no room beneath.
+- **Search annotations**, at the top, filters the cards as you type. It
+  forgives a slip or two in each word. Clicking a result shows it among all
+  the others; clicking it again goes to it in the document. Esc clears the
+  search.
+- **The order button** beside the search box switches between the order things
+  appear in the document and the order you added them.
+- **A highlight longer than five lines** is cut short, fading out. Click it
+  once to read the whole thing and again to go to it. "Show less" cuts it
+  short again.
+- **The note button** makes a markdown note (see below).
 
-Clicking a highlight and right-clicking it reach the same note through the same
-code, including where the box appears and when it refuses, so the two cannot
-drift apart.
+### Making a note
 
-The plugin stays quiet. Highlighting, noting, undoing and toggling highlight
-mode say nothing, because what changed is already on screen. The only thing it
-announces is the transcript being created, since a file has then appeared in
-the vault that was not there before and where it appeared is not obvious. The
-rest of its messages are failures: annotations it could not read, a save that
-did not happen, a markdown file it has left alone because it is not the
-plugin's own.
-
-## Zoom
-
-Each PDF reopens at the zoom you last read it at, which a setting turns off.
-
-It is kept in Obsidian's per-device store rather than in the plugin's settings
-file, because a comfortable zoom depends on the screen in front of you and
-should not follow you between machines. Obsidian keeps which headings you have
-folded in the same place, for the same reason. The two hundred most recently
-read PDFs are remembered.
-
-Reading and setting the zoom means reaching through Obsidian's PDF view into
-the PDF.js viewer it wraps, which is not part of the plugin API. Every step of
-that is checked, and a shape the plugin does not recognise means the zoom is
-simply not remembered. Nothing else in the plugin depends on it, so an Obsidian
-update that moves it can cost this feature and nothing more.
-
-## Undoing
-
-Cmd or Ctrl with Z steps back through the highlights and notes on the PDF you
-are looking at. Adding Shift steps forward again, and on Windows and Linux so
-does Y. Everywhere else those keys keep their usual meaning.
-
-Inside a note box they undo what you typed rather than the annotation around
-it, and they group it the way the rest of Obsidian does. A note box is a plain
-text field, and a text field's own undo steps through a typed run one character
-at a time, which felt foreign. It now keeps its own history using CodeMirror's
-rule: a new undo step begins only when you pause typing, so a burst comes back
-as a burst.
-
-They cannot be rebound, and the reason is worth knowing. On the desktop the
-editor's undo is not an Obsidian command but CodeMirror's own key handling, and
-Obsidian's hotkey dispatcher sees keys before the editor does and stops a bound
-key travelling any further. A plugin command on that key would stop editor undo
-working anywhere, and because there is no command for it to conflict with, the
-hotkey settings would not warn you. So the plugin catches the key itself and
-claims it only for keystrokes that belong to a PDF. The trade is that it does
-not appear in Settings under Hotkeys and cannot be changed there.
-
-Two commands exist as well, **Undo last annotation change** and **Redo last
-undone annotation change**, for the command palette or for a second key of your
-own.
-
-The history holds whole copies of the annotations rather than a description of
-what changed, which is wasteful in principle and completely reliable at this
-size. It goes fifty changes back per PDF, lives in memory, and is lost when
-Obsidian restarts. It is also cleared whenever the annotations file changes from
-outside the plugin, since an undo would otherwise write the plugin's older idea
-of that file over somebody else's newer one. A sync between machines will
-therefore clear it.
-
-## The two files beside your PDF
-
-For `refs/paper.pdf` you get:
-
-**`refs/paper.annotations.json`** — the annotations themselves, and the only
-copy of them. Plain JSON: syncs, diffs and backs up like anything else. Keep it
-next to the PDF when you move things around. Each rectangle names its page and
-is stored as fractions of that page, so highlights survive zooming and
-re-rendering and a single highlight can span a page break.
-
-**`refs/paper.md`** — a generated transcript, so highlights are searchable and
-linkable as ordinary markdown. Highlights come out as quoted bullets in reading
-order, a highlight's note indented underneath it, and a note of its own as a
-plain bullet in its place on the page.
+The note button at the top of the sidebar, or the command **Create note from
+annotations**, makes a markdown file with the same name as the PDF or EPUB,
+beside it, and opens it. It holds every highlight and note in reading order.
 
 ```markdown
 - "the smallest unit that can still be called a place"
 	- this is the definition the rest of chapter 3 leans on
-- a thought of mine, anchored to page 14
+- a thought of mine, anchored on page 14
 ```
 
-That file is regenerated from the JSON, so edits to it are not read back and
-will be replaced.
+How it is laid out is up to you; see the settings below. If a file of that
+name already exists, a number is added, so nothing is ever written over. The
+note is yours to edit: the plugin never touches it again, so make another one
+when you want an updated copy.
 
-**It will not overwrite a note of your own.** `<name>.md` beside `<name>.pdf`
-is exactly what you would call a note you were keeping on that PDF by hand, so
-the plugin records a stamp of the last transcript it generated and only rewrites
-the file when what is on disk is what it last put there. Anything else is your
-work: the file is left alone, your highlights stay safe in the JSON, and you are
-told once.
+### EPUB
 
-If the JSON file is ever unreadable, the PDF opens with annotations read-only
-rather than starting over with an empty file, so there is something left to
+EPUBs open in the plugin's own reader, as one continuous scroll through the
+whole book. Everything above works in them as it does in PDFs. The book uses
+your theme's colours and font unless it sets its own. **A+** and **A−** at the
+top change the text size, which is remembered for each book.
+
+Books with DRM, and fixed-layout books such as picture books and magazines,
+can't be opened; the reader says so. Nothing in a book can run: it is shown
+in a sandbox with scripts switched off.
+
+## Settings
+
+- **Snap highlight to whole words.** For boring reasons, highlights can be
+  inaccurate. If you often want to highlight half a word, turn this off.
+  Otherwise, this toggle should improve performance.
+- **Highlight colour.** Used for new highlights. Existing ones keep the colour
+  they were made with.
+- **Highlighted text is enclosed in** single quotation marks, double quotation
+  marks, or nothing.
+- **Highlighted text appears in the .md file as** new bullets, new lines or new
+  paragraphs.
+- **Each note attached to highlighted text appears in the .md file** as a
+  bullet indented under the highlighted text, on a new line under it, in a new
+  paragraph under it, or on the same line as it.
+- **Notes that aren't attached to highlighted text appear in the .md file as**
+  new bullets, new lines or new paragraphs.
+- **Remember each PDF's zoom level.** Each PDF reopens at the zoom you last
+  read it at. This is kept per device, since a comfortable zoom depends on the
+  screen in front of you.
+
+## Undoing
+
+Cmd or Ctrl with Z steps back through the highlights and notes on the document
+you are looking at. Adding Shift steps forward again, and on Windows and Linux
+so does Y. Everywhere else those keys keep their usual meaning. Inside a note
+box they undo your typing, a burst at a time, as the rest of Obsidian does.
+
+The keys can't be rebound. On the desktop, the editor's undo isn't an Obsidian
+command, and a plugin command bound to Cmd+Z would stop it working everywhere
+without the hotkey settings warning you. So the plugin catches the key itself,
+only for keystrokes that belong to a document it shows. The commands **Undo
+last annotation change** and **Redo last undone annotation change** are there
+for the command palette, or for a second key of your own.
+
+The history goes fifty changes back per document, lives in memory, and is lost
+when Obsidian restarts. It is also cleared when the annotations file changes
+from outside the plugin, by a sync for instance.
+
+## Where your annotations live
+
+For `refs/paper.pdf`, the annotations are kept in `refs/paper.annotations.json`.
+For `refs/book.epub`, they are kept in `refs/book.epub.annotations.json`. The
+extension stays in the name so that a PDF and an EPUB with the same name can't
+share one file.
+
+That file is the only copy of your annotations. It is plain JSON, so it
+syncs, diffs and backs up like anything else. Keep it next to its document when
+you move things around. If it is ever unreadable, the document opens with its
+annotations read-only rather than starting over, so there is something left to
 recover.
 
-## When a highlight comes out wrong
+## Notes
 
-How a PDF's text layer is put together differs from file to file, and some of
-it cannot be guessed at from the outside: a tagged PDF keeps some of its text
-in spans the viewer gives no size, and a PDF may draw its running header at any
-point in its content stream rather than where it appears on the page. Both
-affect what a selection turns into.
+- Want Zotero's citation functions? Just point an AI at a final draft and a
+  folder of notes and sources, and it will generate accurate citations in
+  whatever style you like.
+- PDFs and EPUBs can be made in different ways. This means that, like in any
+  annotation tool, highlights may occasionally be mildly inaccurate, like
+  capturing a full stop that you didn't highlight. This is annoying. Will try
+  to improve in v1. The known cases are written up in
+  [KNOWN-ISSUES.md](KNOWN-ISSUES.md). If a highlight in a PDF comes out wrong,
+  select the same text and run the command **Report what the current selection
+  looks like**: it writes a note describing what the viewer saw, which is what
+  explains the result.
 
-The command **Report what the current selection looks like** writes a note
-describing exactly what the viewer reports for every span in the current
-selection, the lines built from them, and the text that would be stored. That
-is the quickest way to say why a particular highlight came out wrong.
+## Wishlist
 
-Four open problems with where a highlight's boundaries land are written up in
-[KNOWN-ISSUES.md](KNOWN-ISSUES.md), with the suspected cause and the next step
-for each.
-
-As a backstop, the assembled text is checked against the browser's own idea of
-what is selected. Assembling text span by span is what lets a missing space be
-put back, but it is also a chance to lose a character, and losing one is worse
-than losing a space. If the two disagree, the browser's text wins and the
-discrepancy goes to the console.
-
-## The text in the settings tab
-
-It lives in `settings-help.md` in the plugin folder, so you can reword it. The
-plugin writes that file out the first time it needs it and never overwrites it
-afterwards, so your edits are kept. Reopen the settings tab to see them.
+- Text-to-speech. This keeps getting better and better. I would rather wait a
+  few generations before trying to add this.
+- AI study partner-like integration. To me, Third Mind Reader has the most
+  interesting approach to this. I may or may not mess with this in the future.
+- RSS / Webclipper integration. I would love to have all of my reading in one
+  app. Maybe in v1.
+- To stop vault bloat, I'd like a command that moves sources to a folder
+  outside of the vault once I'm done with them. I would also like a "Recall"
+  command that would bring them back in quickly if needed, keeping all of the
+  annotation links in place.
+- Integrate with an Obsidian-based source library that shows progress, where
+  you can drag and drop sources to indicate priority, and that auto-detects new
+  PDF and EPUB files.
 
 ## Installing
 
@@ -191,7 +170,11 @@ From the community plugin browser, or by hand: copy `main.js`, `manifest.json`
 and `styles.css` into `<vault>/.obsidian/plugins/minimal-pdf-annotator/` and
 enable the plugin in Settings, then Community plugins.
 
-Works with Obsidian's built-in PDF viewer.
+PDFs open in Obsidian's own PDF viewer, which the plugin works alongside. EPUBs
+open in the plugin's reader. If another plugin already opens EPUBs, only one
+of them can; disable the other to use this one for books.
+
+It has not been tried on Obsidian's mobile apps yet.
 
 ## Tests
 
@@ -199,10 +182,12 @@ Works with Obsidian's built-in PDF viewer.
 node tests/run.js
 ```
 
-No dependencies, no build step. The suite covers the transcript format and the
-rule that decides whether the markdown file may be written, which is the one
-piece of this plugin that can destroy something. Everything that needs a real
-PDF on screen has to be checked by hand; `tests/README.md` lists what.
+No dependencies, no build step. The unit tests cover the pure logic: page
+geometry, how a selection becomes a highlight, the note's layout, undo, the
+sidebar's search and order, footnote regions, and reading an EPUB's zip.
+Everything that needs a document on screen is covered by a separate suite
+that drives a real Obsidian window, kept outside this repository;
+`tests/README.md` says more.
 
 ## Licence
 

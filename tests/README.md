@@ -12,20 +12,16 @@ before compiling. If you add a function you want to test, add it to that list.
 
 ## What this is protecting
 
-**`test-markdown.js`** — two things.
+**`test-markdown.js`** holds every unit test. The name is historical.
 
-`renderMarkdown()`, the transcript written to `<name>.md`: reading order,
-indentation, and the fact that highlighted text is quoted verbatim rather than
-backslash-escaped.
-
-More importantly, `writeMarkdown()`, which decides whether the plugin is
-*allowed* to write that file. The transcript lives at `<name>.md` beside
-`<name>.pdf`, which is also exactly what someone taking notes on a PDF by hand
-would call their note. So a stamp of the last generated text is kept in the
-sidecar, and the file is only rewritten when what is on disk is what we last
-put there. The cases covered: no file yet, a file we wrote, somebody else's
-note, a transcript edited by hand, and a transcript generated before stamps
-were recorded but still in sync (adopted, so upgrading does not strand it).
+`renderExport()` is the note the sidebar's note button makes. The tests cover
+reading order, each of the layout settings and how they combine (a blank line
+wherever a line would otherwise run into a bullet), and the escaping that
+keeps someone's text from turning into a heading, a list or a quote. A number
+keeps its digits and has its full stop escaped instead, since markdown shows a
+backslash before a digit literally. `exportNote()` is covered through a
+stand-in vault: a name already taken, in any case, gets a number rather than
+being written over, and nothing is made when there is nothing to put in it.
 
 The geometry and text extraction are covered too, since both were wrong once
 and the symptoms were subtle:
@@ -40,7 +36,7 @@ and the symptoms were subtle:
   highlight is cut from. The earlier design read the text from character
   offsets and the rectangles from the browser's selection geometry, which are
   two answers to the same question, and they disagreed by a glyph: a highlight
-  would stretch over a full stop the transcript left out, or the transcript
+  would stretch over a full stop the stored text left out, or the text
   would carry one the highlight did not cover.
 - `refineBoundary()` and `nearestPointer()`, which move a boundary to whichever
   nearby one is really closest to the pointer. A PDF viewer stretches each span
@@ -66,11 +62,8 @@ and the symptoms were subtle:
 
 `snapshot()` and the undo history are covered too: stepping back and forward
 over several changes, a redo being discarded as soon as something new happens,
-the fifty-change limit, and two things that must hold. A snapshot is a copy
-rather than a reference, so a later edit cannot reach into the history. And the
-marker recording whether the generated markdown file is still the plugin's own
-is deliberately left out of a snapshot, because restoring an old one would make
-the plugin think somebody else's note had appeared at that path.
+the fifty-change limit, and a snapshot being a copy rather than a reference,
+so a later edit cannot reach into the history.
 
 `NoteHistory` is covered as well. A note box is a plain text field, and a text
 field's own undo steps through a typed run one character at a time, which does
@@ -88,9 +81,9 @@ than keeping an empty one.
 
 `onContextMenu()` is covered through a stand-in menu that records what was
 offered. Right-clicking highlighted text used to create a note of its own
-anchored at that point, which in the transcript is a bullet of its own, so it
-had nothing to sit under. The assertions say which item each kind of
-right-click offers and which note it opens.
+anchored at that point, which in an exported note is a bullet of its own, so
+it had nothing to sit under. The assertions say which item each kind of
+right-click offers and which card it sends you to.
 
 The zoom memory is covered too: which values the viewer will accept, the
 least-recently-used pruning that keeps the store from growing without end, and
@@ -100,30 +93,31 @@ reaching into Obsidian's PDF view is not part of the plugin API, so a shape
 the plugin does not recognise must mean the zoom is not remembered rather than
 an error.
 
-`anchorFor()` and `placeBox()` decide where a note box opens. Carrying the
-element from the click that asked for the note was a bug: a context-menu item
-runs after the menu closes, a redraw may have replaced that element in the
-meantime, and a detached element measures as nothing, which put the box in the
-top-left corner of the window. The anchor is now looked up by id when the box
-opens. The assertions cover skipping a replaced element, the fallbacks when
-nothing is on screen, keeping the box inside the window, that the anchor covers
-every line of a highlight rather than only its first, and that both ways of
-asking for a note refuse in the same circumstances. `clampToViewport()` is
-shared by the opening placement and by dragging, so a box cannot be left
-somewhere it cannot be reached.
+`placeBox()` and `clampToViewport()` place the footnote preview beside its
+marker and inside the window.
 
-`BoxDrag` holds the state of a drag of the note box, apart from the event
-wiring, because the drag failed to end when the button was released: the box
-stops mouse events from travelling further, so it swallowed the release before
-the document heard it. The listeners now go on in the capture phase, and two
-rules here end the drag even when a release is missed entirely. The assertions
-cover a move before a drag, after one, with no button held, and a second drag
-starting from wherever the box was left.
+The sidebar's pure parts are covered: `annotationItems()` (reading order and
+date order, for PDFs and books alike), `matchesQuery()` and the edit distance
+behind it (a slip or two forgiven per word, but letters scattered across a
+passage are no match), editing and deleting from a card as undo steps, and
+changing the order.
 
-## Not covered
+`destPoint()` and `footnoteRegion()` decide what a PDF footnote preview
+shows: the line the link points at whether the PDF marks its top or its
+baseline, the text column's width, no further down than the last line in
+reach, and a narrow column widened rather than magnified.
 
-Anything that needs a DOM or a running Obsidian: the selection handling that
-drives the functions above, the highlight overlays, the note box, the toolbar
-button, the mutation observer that redraws overlays as the viewer recycles page
-DOM, and the reload that fires when the annotations file changes on disk. Those
-need checking by hand.
+For EPUBs: `readZip()` against a real zip, paths inside a book,
+`drmProtected()` (font obfuscation is not DRM), `snapOffset()`,
+`findQuote()` for a highlight whose place in a changed book has moved, and the
+name of a book's annotations file.
+
+## The window suite
+
+Everything that needs a document on screen is covered by a second suite that
+drives a real Obsidian window through Obsidian's command line, with real mouse
+and key events: highlighting to the pixel in PDFs and EPUBs, undo keys, the
+sidebar, search, the note button, footnote previews, text size, and the
+refusal messages for DRM and fixed-layout books. It needs a test vault and a
+window on screen, so it lives outside this repository, beside the vault it
+was developed in.
