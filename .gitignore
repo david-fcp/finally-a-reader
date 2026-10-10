@@ -1,0 +1,9 @@
+# Written by Obsidian at runtime.
+data.json
+
+# Created by the plugin on first load, then yours to edit.
+settings-help.md
+
+node_modules/
+.DS_Store
+.claude/

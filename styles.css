@@ -1,0 +1,218 @@
+/* Minimal PDF annotator.
+
+   Class prefix "mpa-". Geometry that has to come from script (a highlight's
+   position on its page, the note box following the pointer) is passed in as
+   custom properties rather than as inline style declarations, so every rule
+   that decides how something looks lives in this file. */
+
+/* ------------------------------------------------------------- highlights */
+
+.mpa-layer {
+  /* How far a note marker sits in from the page's left edge. Declared here so
+     a CSS snippet can change it without touching the plugin. */
+  --mpa-margin-inset: 6px;
+
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 3;
+}
+
+.mpa-highlight {
+  position: absolute;
+  left: var(--mpa-x, 0);
+  top: var(--mpa-y, 0);
+  width: var(--mpa-w, 0);
+  height: var(--mpa-h, 0);
+  background-color: var(--mpa-color, #ffeb3b);
+  opacity: 0.4;
+  mix-blend-mode: multiply;
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+/* Highlight mode is a modal state, so the page says so under the pointer. */
+body.mpa-mode-active .textLayer {
+  cursor: crosshair;
+}
+
+/* ------------------------------------------------------------ note markers */
+
+/* Note markers sit in the page's left margin, level with whatever they belong
+   to, so one never covers the words it refers to. */
+.mpa-note-icon {
+  position: absolute;
+  left: 0;
+  top: var(--mpa-y, 0);
+  transform: translate(var(--mpa-margin-inset, 6px), -50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  color: var(--mpa-color, #ffeb3b);
+  pointer-events: auto;
+  cursor: pointer;
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.25));
+  z-index: 4;
+}
+
+.mpa-note-icon:hover {
+  opacity: 0.85;
+}
+
+.mpa-note-icon svg {
+  width: 14px;
+  height: 14px;
+  /* Filled rather than outlined, so a small marker still reads as one against
+     the page behind it. */
+  fill: var(--mpa-color, #ffeb3b);
+  stroke: var(--text-normal);
+  stroke-width: 1.4;
+}
+
+/* --------------------------------------------------------------- note box */
+
+.mpa-note-box {
+  position: fixed;
+  left: var(--mpa-note-x, 0);
+  top: var(--mpa-note-y, 0);
+  z-index: var(--layer-popover, 30);
+  min-width: 240px;
+  padding: 6px;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  box-shadow: var(--shadow-s);
+}
+
+/* The strip the box is dragged by. Dragging the text area itself would fight
+   with selecting text in it. */
+.mpa-note-handle {
+  height: 14px;
+  margin: -2px -2px 2px;
+  border-radius: var(--radius-s);
+  cursor: move;
+}
+
+.mpa-note-handle::after {
+  content: '';
+  display: block;
+  width: 28px;
+  height: 3px;
+  margin: 5px auto 0;
+  border-radius: 2px;
+  background: var(--background-modifier-border);
+}
+
+.mpa-note-handle:hover::after {
+  background: var(--background-modifier-border-hover);
+}
+
+.mpa-note-box textarea {
+  width: 100%;
+  min-height: 60px;
+  padding: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text-normal);
+  resize: vertical;
+  font-family: var(--font-interface);
+  font-size: var(--font-ui-small);
+}
+
+/* ---------------------------------------------------------------- toggles */
+
+.mpa-ribbon-active {
+  color: var(--mpa-mode-color, #ffeb3b);
+}
+
+.mpa-status {
+  cursor: pointer;
+}
+
+.mpa-status-swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 6px;
+  border-radius: 2px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--mpa-mode-color, #ffeb3b);
+  vertical-align: middle;
+  opacity: 0.35;
+}
+
+.mpa-status span:last-child {
+  opacity: 0.6;
+}
+
+.mpa-status.mpa-status-active .mpa-status-swatch,
+.mpa-status.mpa-status-active span:last-child {
+  opacity: 1;
+}
+
+.mpa-toolbar-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  margin: 0 2px;
+  border-radius: var(--radius-s);
+  cursor: pointer;
+}
+
+.mpa-toolbar-btn.is-active {
+  background: var(--background-modifier-hover);
+  color: var(--mpa-color, #ffeb3b);
+}
+
+/* Fallback placement for viewers with no toolbar to inject into. The parent
+   is given a positioning context here rather than from script, so no core
+   element gets an inline style written onto it. */
+.mpa-toolbar-btn-floating {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 10;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  box-shadow: var(--shadow-s);
+}
+
+.pdf-container:has(> .mpa-toolbar-btn-floating),
+.workspace-leaf-content[data-type="pdf"]:has(> .mpa-toolbar-btn-floating) {
+  position: relative;
+}
+
+/* ------------------------------------------------- settings explanatory text */
+
+/* Rendered from settings-help.md, so it is ordinary markdown rather than a
+   stack of setting rows. Toned down to sit below the settings proper. */
+.mpa-help {
+  margin-top: var(--size-4-6);
+  padding-top: var(--size-4-4);
+  border-top: 1px solid var(--background-modifier-border);
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+}
+
+.mpa-help h2 {
+  margin: var(--size-4-4) 0 var(--size-4-2);
+  font-size: var(--font-ui-medium);
+  color: var(--text-normal);
+}
+
+.mpa-help :first-child {
+  margin-top: 0;
+}
+
+.mpa-help p,
+.mpa-help ul {
+  margin: var(--size-4-2) 0;
+}
+
+.mpa-help code {
+  font-size: var(--font-smaller);
+}

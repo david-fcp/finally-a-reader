@@ -1,0 +1,2215 @@
+'use strict';
+
+/*
+ * Minimal PDF annotator.
+ *
+ * Select text in a PDF with highlight mode on and it is highlighted. Click a
+ * highlight to attach a note; right-click a page for a standalone note.
+ *
+ * Two files sit next to each PDF:
+ *   <name>.annotations.json  the annotations themselves, and the only source
+ *                            of truth. Safe to sync, diff and back up.
+ *   <name>.md                a generated transcript of them, so highlights are
+ *                            searchable and linkable as ordinary markdown.
+ *
+ * The markdown file is rewritten from the JSON, so the plugin will not touch
+ * one it does not recognise as its own: see writeMarkdown().
+ */
+
+const {
+  Plugin,
+  PluginSettingTab,
+  Setting,
+  Menu,
+  Notice,
+  TFile,
+  Platform,
+  MarkdownRenderer,
+  debounce,
+  setIcon,
+  normalizePath,
+} = require('obsidian');
+
+const DEFAULT_SETTINGS = {
+  highlightColor: '#ffeb3b',
+  snapToWords: true,
+  rememberZoom: true,
+};
+
+const HEX_COLOR_RE = /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
+
+/* How many changes back the undo history goes, per PDF. The history lives in
+   memory and is lost when Obsidian restarts, as undo histories are. */
+const UNDO_LIMIT = 50;
+
+/* Remembered zoom levels, kept per device rather than in the plugin's settings
+   file. A comfortable zoom depends on the screen in front of you, so this is
+   not something to carry between machines. Obsidian's own per-device store is
+   the right home for it; it is also where Obsidian keeps which headings you
+   have folded, for the same reason. */
+const ZOOM_STORE_KEY = 'pdf-zoom';
+const ZOOM_LIMIT = 200;
+/* What the viewer accepts besides a number. */
+const ZOOM_WORDS = ['auto', 'page-actual', 'page-fit', 'page-width', 'page-height'];
+
+/* Obsidian's built-in PDF viewer registers this view type. */
+const PDF_VIEW_TYPE = 'pdf';
+
+class MinimalPdfAnnotatorPlugin extends Plugin {
+  async onload() {
+    await this.loadSettings();
+
+    /* Per PDF: the annotations, and the lock that serialises writes to them.
+       Keyed by path, because two leaves can show the same PDF and must not
+       each keep their own copy of the data. */
+    /** @type {Map<string, DocState>} */
+    this.docs = new Map();
+    /* Per open leaf: the DOM it owns. Keyed by the view object itself rather
+       than by path, for the same reason. */
+    /** @type {Map<object, ViewState>} */
+    this.views = new Map();
+
+    this.highlightMode = false;
+    this.noteBox = null;
+    this.noteHistory = null;
+    this.recentView = null;
+    this.zooms = this.readZooms();
+    /* A pinch or a run of zoom steps changes the value many times over; the
+       store only needs the one it settles on. */
+    this.saveZooms = debounce(() => this.writeZooms(), 400, false);
+    /* Where the drag began and ended. Needed because the browser's idea of
+       which character a pointer landed on is approximate in a PDF; see
+       refineBoundary(). */
+    this.pointers = { down: null, up: null };
+
+    this.applyModeColor();
+
+    this.ribbonEl = this.addRibbonIcon('highlighter', 'Toggle PDF highlight mode', () =>
+      this.toggleHighlightMode()
+    );
+
+    /* A status bar toggle as well, so the feature is still reachable when the
+       ribbon is hidden. */
+    this.statusEl = this.addStatusBarItem();
+    this.statusEl.addClass('mpa-status');
+    this.statusEl.setAttribute('aria-label', 'Toggle PDF highlight mode');
+    this.registerDomEvent(this.statusEl, 'click', () => this.toggleHighlightMode());
+    this.updateStatusEl();
+
+    this.addCommand({
+      id: 'toggle-highlight-mode',
+      name: 'Toggle highlight mode',
+      callback: () => this.toggleHighlightMode(),
+    });
+
+    /* Cmd or Ctrl with Z already works inside a PDF, from onKeyDown. These
+       exist for the command palette, and for anyone who wants a second key of
+       their own; that key must not be the one onKeyDown handles, for the
+       reason given there. */
+    this.addCommand({
+      id: 'undo-annotation',
+      name: 'Undo last annotation change',
+      checkCallback: (checking) => {
+        const doc = this.activeDoc();
+        if (!doc || doc.readOnly || !doc.undoStack.length) return false;
+        if (!checking) this.undo(doc);
+        return true;
+      },
+    });
+
+    this.addCommand({
+      id: 'redo-annotation',
+      name: 'Redo last undone annotation change',
+      checkCallback: (checking) => {
+        const doc = this.activeDoc();
+        if (!doc || doc.readOnly || !doc.redoStack.length) return false;
+        if (!checking) this.redo(doc);
+        return true;
+      },
+    });
+
+    this.addCommand({
+      id: 'report-selection',
+      name: 'Report what the current selection looks like',
+      callback: () => {
+        this.writeSelectionReport().catch((e) => this.report('could not write the report', e));
+      },
+    });
+
+    this.addSettingTab(new MinimalPdfAnnotatorSettingTab(this.app, this));
+
+    this.registerEvent(
+      this.app.vault.on('modify', (file) => {
+        if (file instanceof TFile) {
+          this.reloadSidecar(file).catch((e) => this.report('could not reload annotations', e));
+        }
+      })
+    );
+
+    this.registerEvent(this.app.workspace.on('layout-change', () => this.scheduleSync()));
+    this.registerEvent(this.app.workspace.on('active-leaf-change', () => this.scheduleSync()));
+    this.registerEvent(this.app.workspace.on('file-open', () => this.scheduleSync()));
+    this.app.workspace.onLayoutReady(() => this.scheduleSync());
+
+    /* Document-level handlers, so events are caught however Obsidian's PDF
+       viewer wires its own listeners. Each one works out which PDF view the
+       event happened in, if any. mouseup bubbles, so the browser has settled
+       the text selection by the time it is read; click and contextmenu are
+       captured so nothing swallows them first. */
+    this.registerDomEvent(document, 'keydown', (e) => this.onKeyDown(e), true);
+    this.registerDomEvent(document, 'mousedown', (e) => this.onMouseDown(e));
+    this.registerDomEvent(document, 'mouseup', (e) => this.onMouseUp(e));
+    this.registerDomEvent(document, 'click', (e) => this.onClick(e), true);
+    this.registerDomEvent(document, 'contextmenu', (e) => this.onContextMenu(e), true);
+  }
+
+  onunload() {
+    for (const state of this.views.values()) this.syncZoom(state);
+    this.closeNoteBox();
+    document.body.removeClass('mpa-mode-active');
+    document.body.style.removeProperty('--mpa-mode-color');
+    for (const view of Array.from(this.views.keys())) this.teardownView(view);
+    this.views.clear();
+    this.docs.clear();
+  }
+
+  report(what, error) {
+    const message = `Minimal PDF annotator: ${what}`;
+    if (error === undefined) console.error(message);
+    else console.error(message, error);
+  }
+
+  /* ----------------------------------------------------------------- modes */
+
+  applyModeColor() {
+    document.body.style.setProperty('--mpa-mode-color', this.settings.highlightColor);
+  }
+
+  toggleHighlightMode() {
+    this.highlightMode = !this.highlightMode;
+    document.body.toggleClass('mpa-mode-active', this.highlightMode);
+    if (this.ribbonEl) this.ribbonEl.toggleClass('mpa-ribbon-active', this.highlightMode);
+    this.updateStatusEl();
+    /* Every viewer's toolbar button shows the mode, whichever control was
+       actually used to change it. */
+    for (const state of this.views.values()) this.refreshToolbarButton(state);
+  }
+
+  updateStatusEl() {
+    const el = this.statusEl;
+    if (!el) return;
+    el.empty();
+    el.toggleClass('mpa-status-active', this.highlightMode);
+    el.createSpan({ cls: 'mpa-status-swatch' });
+    el.createSpan({ text: this.highlightMode ? 'Highlight: on' : 'Highlight: off' });
+  }
+
+  /* ----------------------------------------------------------------- zoom */
+
+  readZooms() {
+    const out = {};
+    let stored = null;
+    try {
+      stored = this.app.loadLocalStorage(ZOOM_STORE_KEY);
+    } catch (e) {
+      return out;
+    }
+    if (!stored || typeof stored !== 'object') return out;
+    for (const path of Object.keys(stored)) {
+      if (validZoom(stored[path])) out[path] = stored[path];
+    }
+    return out;
+  }
+
+  writeZooms() {
+    try {
+      this.app.saveLocalStorage(ZOOM_STORE_KEY, this.zooms);
+    } catch (e) {
+      this.report('could not save the zoom level', e);
+    }
+  }
+
+  noteZoom(path, value) {
+    if (!this.settings.rememberZoom || !validZoom(value)) return;
+    if (this.zooms[path] === value) return;
+    /* Deleted first, so the key moves to the end and the order stays
+       least recently used first. */
+    delete this.zooms[path];
+    this.zooms[path] = value;
+    pruneZooms(this.zooms, ZOOM_LIMIT);
+    this.saveZooms();
+  }
+
+  /* Restores the remembered zoom once, then records any change to it
+     afterwards. Called from render(), which already runs on the frame after
+     the viewer rebuilds its pages, and changing the zoom is one of the things
+     that rebuilds them. */
+  syncZoom(state) {
+    const viewer = pdfViewerOf(state.view);
+    if (!viewer) return;
+
+    if (state.pendingZoom) {
+      /* Before the pages exist, setting the scale does nothing. */
+      if (!viewer.pagesCount) return;
+      const wanted = state.pendingZoom;
+      state.pendingZoom = null;
+      if (viewer.currentScaleValue === wanted) return;
+      try {
+        viewer.currentScaleValue = wanted;
+      } catch (e) {
+        this.report('could not restore the zoom level', e);
+      }
+      return;
+    }
+
+    if (state.doc) this.noteZoom(state.doc.file.path, viewer.currentScaleValue);
+  }
+
+  /* ------------------------------------------------------- attach / detach */
+
+  /* A leaf's view exists before its file is loaded into it, and the layout
+     events can all fire inside that window. Syncing again a tick later is what
+     catches a PDF opened in a new tab, which otherwise never gets attached to
+     and shows none of its highlights. */
+  scheduleSync() {
+    this.syncViews();
+    if (this.syncQueued) return;
+    this.syncQueued = true;
+    const timer = window.setTimeout(() => {
+      this.syncQueued = false;
+      this.syncViews();
+    }, 100);
+    this.register(() => window.clearTimeout(timer));
+  }
+
+  /* Picks up PDF leaves that have appeared and lets go of the ones that have
+     gone. */
+  syncViews() {
+    const live = new Set();
+    for (const leaf of this.app.workspace.getLeavesOfType(PDF_VIEW_TYPE)) {
+      const view = leaf.view;
+      if (!view) continue;
+      /* Still open, so not a teardown candidate even if its file has not
+         arrived yet. */
+      live.add(view);
+      if (this.views.has(view) || !(view.file instanceof TFile)) continue;
+      this.setupView(view).catch((e) => this.report('could not attach to a PDF view', e));
+    }
+    for (const view of Array.from(this.views.keys())) {
+      if (!live.has(view)) this.teardownView(view);
+    }
+  }
+
+  async setupView(view) {
+    const file = view.file;
+    const container = view.containerEl || view.contentEl;
+
+    /* Claim the slot before the first await, so a second layout-change
+       arriving mid-load does not start a duplicate attach. */
+    /** @type {ViewState} */
+    const state = { view, container, doc: null, observer: null, frame: 0, pendingZoom: null };
+    this.views.set(view, state);
+
+    try {
+      state.doc = await this.loadDoc(file);
+    } catch (e) {
+      this.views.delete(view);
+      throw e;
+    }
+    /* The leaf may have closed while the sidecar was being read. */
+    if (!this.views.has(view)) return;
+
+    if (this.settings.rememberZoom) state.pendingZoom = this.zooms[file.path] || null;
+
+    /* The viewer rebuilds page DOM as you scroll and on every zoom step, which
+       wipes our overlays, so they are re-drawn on mutation. Our own drawing
+       mutates the same subtree, so the observer is suspended for the duration:
+       without that it retriggers itself and spins for as long as the PDF is
+       open. */
+    state.observer = new MutationObserver(() => this.scheduleRedraw(state));
+    state.observer.observe(container, { childList: true, subtree: true });
+
+    for (const other of this.views.values()) {
+      if (other.doc === state.doc) this.render(other);
+    }
+  }
+
+  teardownView(view) {
+    const state = this.views.get(view);
+    if (!state) return;
+    /* A last look before the view goes, in case the zoom was changed and
+       nothing redrew afterwards. */
+    this.syncZoom(state);
+    this.views.delete(view);
+    if (state.observer) state.observer.disconnect();
+    if (state.frame) window.cancelAnimationFrame(state.frame);
+    state.container
+      .querySelectorAll('.mpa-layer, .mpa-toolbar-btn')
+      .forEach((el) => el.remove());
+    /* The annotations stay cached for the session. Dropping them here would
+       discard a save still in flight, and would race a second tab that is
+       part-way through loading the same PDF. */
+  }
+
+  /* Redraws on the next animation frame, coalescing a burst of mutations into
+     one pass. A timer was visible as a flicker: zooming replaces the page DOM,
+     taking our overlays with it, and anything longer than a frame leaves the
+     highlights missing for long enough to see. */
+  scheduleRedraw(state) {
+    if (state.frame) return;
+    state.frame = window.requestAnimationFrame(() => {
+      state.frame = 0;
+      this.render(state);
+    });
+  }
+
+  /* Runs `fn` without the view's own observer reacting to it. */
+  withoutObserver(state, fn) {
+    const observer = state.observer;
+    if (observer) observer.disconnect();
+    try {
+      fn();
+    } finally {
+      if (observer && this.views.has(state.view)) {
+        observer.observe(state.container, { childList: true, subtree: true });
+      }
+    }
+  }
+
+  /* ------------------------------------------------------ paths and the IO */
+
+  getSidecarPath(pdfFile) {
+    return pdfFile.path.replace(/\.pdf$/i, '') + '.annotations.json';
+  }
+
+  getMarkdownPath(pdfFile) {
+    return pdfFile.path.replace(/\.pdf$/i, '') + '.md';
+  }
+
+  async loadDoc(file) {
+    const existing = this.docs.get(file.path);
+    if (existing) return existing;
+
+    const loaded = await this.readSidecar(file);
+    /* A second caller may have finished first while this one was reading. */
+    const raced = this.docs.get(file.path);
+    if (raced) return raced;
+
+    /** @type {DocState} */
+    const doc = {
+      file,
+      data: loaded.data,
+      readOnly: !loaded.ok,
+      saveChain: Promise.resolve(),
+      markdownWarned: false,
+      sidecarStamp: null,
+      /* The state as of the last change, which is what commit() pushes. */
+      baseline: snapshot(loaded.data),
+      undoStack: [],
+      redoStack: [],
+    };
+    this.docs.set(file.path, doc);
+    return doc;
+  }
+
+  async readSidecar(pdfFile) {
+    const path = this.getSidecarPath(pdfFile);
+    const file = this.app.vault.getAbstractFileByPath(path);
+    const empty = { highlights: [], notes: [], markdownStamp: null };
+    if (!(file instanceof TFile)) return { data: empty, ok: true };
+    try {
+      const parsed = JSON.parse(await this.app.vault.read(file));
+      const highlights = Array.isArray(parsed.highlights) ? parsed.highlights : [];
+      return {
+        ok: true,
+        data: {
+          highlights: highlights.map(migrateHighlight),
+          notes: Array.isArray(parsed.notes) ? parsed.notes : [],
+          markdownStamp: typeof parsed.markdownStamp === 'string' ? parsed.markdownStamp : null,
+        },
+      };
+    } catch (e) {
+      /* Carrying on with empty data would present as "annotations lost" and
+         then overwrite the damaged file with nothing. The PDF opens read-only
+         instead, so whatever is in that file is still there to be recovered. */
+      this.report(`could not parse ${path}; annotations for this PDF are read-only until it is fixed`, e);
+      new Notice(
+        `Could not read ${path}. Annotations for this PDF are read-only until that file is fixed.`,
+        10000
+      );
+      return { data: empty, ok: false };
+    }
+  }
+
+  /* Writes are queued per PDF: a burst of highlights would otherwise have
+     several vault.modify calls in flight against the same file at once. */
+  queueSave(doc) {
+    if (doc.readOnly) return doc.saveChain;
+    doc.saveChain = doc.saveChain
+      .then(() => this.save(doc))
+      .catch((e) => {
+        this.report('could not save annotations', e);
+        new Notice('Could not save the annotation. See the console for details.');
+      });
+    return doc.saveChain;
+  }
+
+  async save(doc) {
+    await this.writeMarkdown(doc);
+    const path = this.getSidecarPath(doc.file);
+    const content = JSON.stringify(doc.data, null, 2) + '\n';
+    /* Recorded before the write, not after. The vault's change event can
+       arrive while the write is still being awaited, and reloadSidecar would
+       then read a file it had not been told about and throw away the undo
+       history after every single change. */
+    doc.sidecarStamp = stamp(content);
+
+    const existing = this.app.vault.getAbstractFileByPath(path);
+    if (existing instanceof TFile) await this.app.vault.modify(existing, content);
+    else await this.app.vault.create(path, content);
+  }
+
+  /* The markdown file is generated, so it gets overwritten on every change.
+     That is only safe for a file this plugin wrote: "<name>.md" next to
+     "<name>.pdf" is exactly what someone taking notes on a PDF by hand would
+     call their note, and silently replacing it would destroy their work.
+
+     So a stamp of the last generated text is kept in the sidecar, and the file
+     is only rewritten when what is on disk is what we last put there. Anything
+     else is somebody's own note: leave it alone and say so once. */
+  async writeMarkdown(doc) {
+    const path = this.getMarkdownPath(doc.file);
+    const md = renderMarkdown(doc.data);
+    const existing = this.app.vault.getAbstractFileByPath(path);
+
+    if (!(existing instanceof TFile)) {
+      if (!md) return;
+      await this.app.vault.create(path, md);
+      doc.data.markdownStamp = stamp(md);
+      /* The one thing worth saying out loud: a file has appeared in the vault
+         that was not there before, and where it appeared is not obvious. */
+      new Notice(`Created ${path}`);
+      return;
+    }
+
+    const current = await this.app.vault.read(existing);
+    const ours = doc.data.markdownStamp === stamp(current);
+    /* Already byte-identical to what we would write: ours, or in sync with it,
+       either way safe to adopt. This is also what upgrades a file generated
+       before stamps were recorded. */
+    if (!ours && current !== md) {
+      if (!doc.markdownWarned) {
+        doc.markdownWarned = true;
+        new Notice(
+          `${path} was not written by this plugin, so it has been left alone. ` +
+            'Your highlights are safe in the .annotations.json file beside it.',
+          10000
+        );
+      }
+      return;
+    }
+
+    if (current !== md) await this.app.vault.modify(existing, md);
+    doc.data.markdownStamp = stamp(md);
+  }
+
+  /* The settings tab's explanatory text, from the editable file beside the
+     plugin. Created from the built-in text the first time it is wanted. */
+  async loadHelpText() {
+    const dir = this.manifest.dir;
+    if (!dir) return DEFAULT_HELP;
+    const path = normalizePath(`${dir}/${HELP_FILE}`);
+    const adapter = this.app.vault.adapter;
+    try {
+      if (await adapter.exists(path)) return await adapter.read(path);
+      await adapter.write(path, DEFAULT_HELP);
+    } catch (e) {
+      this.report(`could not read or create ${path}, using the built-in text`, e);
+    }
+    return DEFAULT_HELP;
+  }
+
+  /* ----------------------------------------------------------- dispatching */
+
+  /* The view an event landed in, plus whichever of our own elements it hit. */
+  locate(e) {
+    const target = e.target;
+    if (!(target instanceof Element)) return null;
+    for (const state of this.views.values()) {
+      if (!state.doc || !state.container.contains(target)) continue;
+      this.recentView = state.view;
+      return {
+        state,
+        pageEl: target.closest('.page'),
+        highlightEl: target.closest('.mpa-highlight'),
+        noteIconEl: target.closest('.mpa-note-icon'),
+      };
+    }
+    return null;
+  }
+
+  /* A PDF whose sidecar would not parse is shown but not edited, so a change
+     is refused up front rather than accepted and then dropped at save time.
+     Checked by every way of starting a change, so that clicking a highlight
+     and right-clicking it behave the same. */
+  canEdit(doc) {
+    if (!doc.readOnly) return true;
+    new Notice('This PDF’s annotations file could not be read, so it cannot be edited.');
+    return false;
+  }
+
+  /* Cmd or Ctrl with Z inside a PDF, caught here rather than registered as a
+     hotkey.
+
+     The difference matters. Obsidian's hotkey dispatcher listens on the window
+     in the capture phase and stops a bound key travelling any further, and on
+     the desktop the editor's undo is not an Obsidian command but CodeMirror's
+     own key handling. A plugin command bound to this key would therefore stop
+     editor undo working everywhere, and the hotkey settings would not warn
+     about it, because there is no command for it to conflict with.
+
+     Nothing is bound to the key, so Obsidian passes it on, and this listener
+     claims it only for keystrokes that belong to a PDF. The cost of working
+     this way is that the key cannot be rebound from the settings; the two
+     commands can. */
+  onKeyDown(e) {
+    if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
+
+    const code = e.code;
+    const key = (e.key || '').toLowerCase();
+    const isZ = code === 'KeyZ' || key === 'z';
+    const isY = code === 'KeyY' || key === 'y';
+    const undo = isZ && !e.shiftKey;
+    /* Shift with Z everywhere, and Y as well where that is the convention. */
+    const redo = (isZ && e.shiftKey) || (isY && !Platform.isMacOS);
+    if (!undo && !redo) return;
+
+    const target = e.target;
+    if (target instanceof Element) {
+      /* A note box undoes the words in it, not the annotation around it, and
+         does so through its own history rather than the browser's. */
+      if (this.noteHistory && target === this.noteHistory.el) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (undo) this.noteHistory.undo();
+        else this.noteHistory.redo();
+        return;
+      }
+      /* Anything else with an undo of its own keeps the key untouched. */
+      if (target.closest('.mpa-note-box, input, textarea, .cm-editor, [contenteditable="true"]')) {
+        return;
+      }
+    }
+
+    const doc = this.activeDoc();
+    if (!doc || doc.readOnly) return;
+
+    /* Claimed either way, so the key never does something unexpected in a
+       PDF just because there is nothing left to undo. */
+    e.preventDefault();
+    e.stopPropagation();
+    if (undo) this.undo(doc);
+    else this.redo(doc);
+  }
+
+  onMouseDown(e) {
+    if (e.button !== 0) return;
+    this.pointers.down = { x: e.clientX, y: e.clientY };
+    this.pointers.up = null;
+  }
+
+  onMouseUp(e) {
+    if (!this.highlightMode || e.button !== 0) return;
+    this.pointers.up = { x: e.clientX, y: e.clientY };
+    const hit = this.locate(e);
+    if (!hit || !this.canEdit(hit.state.doc)) return;
+    this.addHighlightsFromSelection(hit.state);
+  }
+
+  onClick(e) {
+    if (e.button !== 0) return;
+    const hit = this.locate(e);
+    if (!hit) return;
+
+    if (hit.noteIconEl) {
+      e.stopPropagation();
+      const id = hit.noteIconEl.dataset.noteId;
+      if (hit.noteIconEl.dataset.noteKind === 'note') this.openStandaloneNote(hit.state, id);
+      else this.openHighlightNote(hit.state, id);
+      return;
+    }
+    if (hit.highlightEl) {
+      this.openHighlightNote(hit.state, hit.highlightEl.dataset.highlightId);
+      return;
+    }
+    this.closeNoteBox();
+  }
+
+  onContextMenu(e) {
+    const hit = this.locate(e);
+    if (!hit || !hit.pageEl) return; // only intercept a right-click on a page
+    if (hit.state.doc.readOnly) return; // leave the viewer's own menu in place
+
+    const { state, pageEl, noteIconEl } = hit;
+    const iconKind = noteIconEl ? noteIconEl.dataset.noteKind : null;
+    const iconId = noteIconEl ? noteIconEl.dataset.noteId : null;
+
+    /* Right-clicking the icon of a highlight's note counts as right-clicking
+       that highlight. */
+    let highlightId = hit.highlightEl ? hit.highlightEl.dataset.highlightId : null;
+    if (!highlightId && iconKind === 'highlight') highlightId = iconId;
+
+    const menu = new Menu();
+
+    /* A note asked for on top of a highlight belongs to that highlight, not to
+       the point on the page. Making a standalone note there instead left it
+       with nothing to sit under in the transcript, and gave the highlight two
+       separate things attached to the same words. */
+    if (iconKind === 'note') {
+      menu.addItem((item) =>
+        item
+          .setTitle('Edit note')
+          .setIcon('sticky-note')
+          .onClick(() => this.openStandaloneNote(state, iconId))
+      );
+    } else if (highlightId) {
+      const existing = state.doc.data.highlights.find((h) => h.id === highlightId);
+      menu.addItem((item) =>
+        item
+          .setTitle(existing && existing.note ? 'Edit note' : 'Add note')
+          .setIcon('sticky-note')
+          .onClick(() => this.openHighlightNote(state, highlightId))
+      );
+    } else {
+      menu.addItem((item) =>
+        item
+          .setTitle('Add note')
+          .setIcon('sticky-note')
+          .onClick(() => this.addStandaloneNote(state, e, pageEl))
+      );
+    }
+
+    if (iconKind === 'note') {
+      menu.addItem((item) =>
+        item
+          .setTitle('Remove note')
+          .setIcon('trash')
+          .onClick(() => {
+            state.doc.data.notes = state.doc.data.notes.filter((n) => n.id !== iconId);
+            this.commit(state.doc, 'removing a note');
+          })
+      );
+    } else if (highlightId) {
+      const highlight = state.doc.data.highlights.find((h) => h.id === highlightId);
+      if (highlight && highlight.note) {
+        menu.addItem((item) =>
+          item
+            .setTitle('Remove note')
+            .setIcon('trash')
+            .onClick(() => {
+              highlight.note = '';
+              this.commit(state.doc, 'removing a note');
+            })
+        );
+      }
+      menu.addItem((item) =>
+        item
+          .setTitle('Remove highlight')
+          .setIcon('trash')
+          .onClick(() => {
+            state.doc.data.highlights = state.doc.data.highlights.filter((h) => h.id !== highlightId);
+            this.commit(state.doc, 'removing a highlight');
+          })
+      );
+    }
+
+    e.preventDefault();
+    menu.showAtMouseEvent(e);
+  }
+
+  /* Persist a change and redraw every view showing that PDF.
+
+     The state being replaced goes onto the undo stack here rather than at each
+     place that changes something, so a new kind of change cannot be added
+     without becoming undoable. `label` says what was done, for the notice that
+     undoing it shows. */
+  commit(doc, label) {
+    doc.undoStack.push({ state: doc.baseline, label: label || 'that change' });
+    while (doc.undoStack.length > UNDO_LIMIT) doc.undoStack.shift();
+    doc.redoStack.length = 0;
+    doc.baseline = snapshot(doc.data);
+
+    this.queueSave(doc);
+    for (const state of this.views.values()) {
+      if (state.doc === doc) this.render(state);
+    }
+  }
+
+  /* ------------------------------------------------------------ undo / redo */
+
+  /* The PDF these commands act on: the one with keyboard focus, or failing
+     that the one last interacted with, as long as it is still on screen. */
+  activeDoc() {
+    const focused = document.activeElement;
+    for (const state of this.views.values()) {
+      if (focused && state.container.contains(focused)) return state.doc;
+    }
+    const recent = this.views.get(this.recentView);
+    if (recent && recent.container.isShown && recent.container.isShown()) return recent.doc;
+    return null;
+  }
+
+  step(doc, from, to) {
+    if (!from.length) return false;
+    const entry = from.pop();
+    to.push({ state: snapshot(doc.data), label: entry.label });
+
+    /* A note box open over the annotation being restored would be left
+       showing text that no longer exists. */
+    this.closeNoteBox();
+    doc.data.highlights = entry.state.highlights;
+    doc.data.notes = entry.state.notes;
+    doc.baseline = snapshot(doc.data);
+
+    this.queueSave(doc);
+    for (const state of this.views.values()) {
+      if (state.doc === doc) this.render(state);
+    }
+    return true;
+  }
+
+  undo(doc) {
+    return this.step(doc, doc.undoStack, doc.redoStack);
+  }
+
+  redo(doc) {
+    return this.step(doc, doc.redoStack, doc.undoStack);
+  }
+
+  /* The annotations file changed underneath us, so whatever history we were
+     holding describes a document that no longer exists. Undoing onto it would
+     write our old idea of the file over somebody else's newer one. */
+  async reloadSidecar(file) {
+    for (const doc of this.docs.values()) {
+      if (file.path !== this.getSidecarPath(doc.file)) continue;
+      let raw;
+      try {
+        raw = await this.app.vault.read(file);
+      } catch (e) {
+        return;
+      }
+      if (stamp(raw) === doc.sidecarStamp) return; // our own write coming back
+
+      const loaded = await this.readSidecar(doc.file);
+      doc.data = loaded.data;
+      doc.readOnly = !loaded.ok;
+      doc.sidecarStamp = stamp(raw);
+      doc.baseline = snapshot(doc.data);
+      doc.undoStack.length = 0;
+      doc.redoStack.length = 0;
+      this.closeNoteBox();
+      for (const state of this.views.values()) {
+        if (state.doc === doc) this.render(state);
+      }
+      return;
+    }
+  }
+
+  /* ------------------------------------------------------------ highlights */
+
+  addHighlightsFromSelection(state) {
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || selection.rangeCount === 0) return;
+    const range = selection.getRangeAt(0);
+
+    /* The pages the selection actually touches, in document order. */
+    const pages = Array.from(state.container.querySelectorAll('.page')).filter((pageEl) => {
+      const textLayer = pageEl.querySelector('.textLayer');
+      return textLayer && range.intersectsNode(textLayer);
+    });
+    if (!pages.length) return;
+
+    const rects = [];
+    const parts = [];
+
+    for (const pageEl of pages) {
+      const textLayer = pageEl.querySelector('.textLayer');
+      const box = pagePaddingBox(pageEl);
+      if (!textLayer || !box) continue;
+
+      const chars = buildChars(involvedNodes(range, textLayer));
+      const slice = selectedSlice(chars, range, this.pointers, this.settings.snapToWords);
+      if (!slice) continue;
+
+      /* A selection crossing a page break also takes in whatever the text
+         layer holds between the two columns of body text: a running header, a
+         page number, a footer. Those sit apart from the body text, so they are
+         dropped. Only for a multi-page selection: within one page, a first or
+         last line standing apart is as likely to be a heading the reader meant
+         to include. */
+      const all = linesFromChars(chars, slice.from, slice.to);
+      const lines = pages.length > 1 ? dropRunningHeads(all) : all;
+      if (!lines.length) continue;
+
+      const page = pageNumberOf(pageEl);
+      for (const line of lines) {
+        /* A line the viewer gave no position to contributes its text but has
+           nothing to draw. */
+        if (line.top === null) continue;
+        rects.push({
+          page,
+          x: (line.left - box.left) / box.width,
+          y: (line.top - box.top) / box.height,
+          w: line.width / box.width,
+          h: line.height / box.height,
+        });
+      }
+      parts.push(lines.map((line) => line.text).join(' '));
+    }
+
+    const text = collapseWhitespace(parts.join(' '));
+    if (!rects.length || !text) return;
+
+    selection.removeAllRanges();
+    /* One highlight, however many pages it runs across, so that removing it
+       removes the whole thing. */
+    state.doc.data.highlights.push({
+      id: uuid(),
+      text,
+      rects,
+      /* Recorded per highlight, so changing the setting later recolours
+         nothing that already exists. */
+      color: this.settings.highlightColor,
+      note: '',
+      createdAt: new Date().toISOString(),
+    });
+    this.commit(state.doc, 'adding a highlight');
+  }
+
+  /* ------------------------------------------------------------ diagnostics */
+
+  /* Writes down what the viewer reports for the current selection: the
+     character array a highlight is cut from, where the two boundaries ended up
+     and where the browser had put them, and the lines and text that follow.
+
+     Some of this depends on how a particular PDF's text layer is put together,
+     which differs between files and cannot be guessed at from the outside.
+     When a highlight comes out wrong, this is what says why. */
+  async writeSelectionReport() {
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
+      new Notice('Select some text in a PDF first.');
+      return;
+    }
+    const range = selection.getRangeAt(0);
+
+    let found = null;
+    for (const state of this.views.values()) {
+      if (state.container.contains(range.commonAncestorContainer)) found = state;
+    }
+    if (!found) {
+      new Notice('That selection is not inside a PDF this plugin is watching.');
+      return;
+    }
+
+    const pages = Array.from(found.container.querySelectorAll('.page')).filter((pageEl) => {
+      const textLayer = pageEl.querySelector('.textLayer');
+      return textLayer && range.intersectsNode(textLayer);
+    });
+
+    const out = [];
+    out.push('# Selection report');
+    out.push('');
+    out.push('PDF: `' + found.doc.file.path + '`');
+    out.push(`Pages touched: ${pages.length}`);
+    out.push(`Snap to whole words: ${this.settings.snapToWords ? 'on' : 'off'}`);
+    out.push(`Pointer down: ${describePoint(this.pointers.down)}`);
+    out.push(`Pointer up: ${describePoint(this.pointers.up)}`);
+    out.push('');
+    out.push('## What the browser says is selected');
+    out.push('');
+    out.push('```');
+    out.push(range.toString());
+    out.push('```');
+    out.push('');
+
+    const parts = [];
+    for (const pageEl of pages) {
+      const page = pageNumberOf(pageEl);
+      const textLayer = pageEl.querySelector('.textLayer');
+      const box = pagePaddingBox(pageEl);
+
+      out.push(`## Page ${page}`);
+      out.push('');
+      out.push(
+        box
+          ? `Page box: left ${round(box.left)}, top ${round(box.top)}, ${round(box.width)} by ${round(box.height)}`
+          : 'Page box: could not be measured'
+      );
+
+      const chars = buildChars(involvedNodes(range, textLayer));
+      const bounds = touchedBounds(chars);
+      const slice = selectedSlice(chars, range, this.pointers, this.settings.snapToWords);
+
+      out.push('');
+      out.push(`Characters measured: ${chars.length}`);
+      out.push(`Where the browser put the two ends: ${bounds ? bounds.from + ' to ' + bounds.to : 'neither is on this page'}`);
+      out.push(`Where they ended up: ${slice ? slice.from + ' to ' + slice.to : 'nothing selected on this page'}`);
+      out.push('');
+
+      if (slice) {
+        out.push('### The two edges');
+        out.push('');
+        out.push('| edge | at | character before | character after | x |');
+        out.push('| --- | --- | --- | --- | --- |');
+        for (const [label, index] of [['start', slice.from], ['end', slice.to]]) {
+          const at = boundaryPosition(chars, index);
+          out.push(
+            `| ${label} | ${index} | ${cell(charAt(chars, index - 1))} | ${cell(charAt(chars, index))} | ${at ? round(at.x) : ''} |`
+          );
+        }
+        out.push('');
+      }
+
+      const all = slice ? linesFromChars(chars, slice.from, slice.to) : [];
+      const kept = pages.length > 1 ? dropRunningHeads(all) : all;
+      const dropped = all.filter((line) => !kept.includes(line));
+
+      out.push(`### Lines (${all.length}, of which ${dropped.length} dropped as a running head)`);
+      out.push('');
+      out.push('| kept | top | height | left | width | text |');
+      out.push('| --- | --- | --- | --- | --- | --- |');
+      for (const line of all) {
+        out.push(
+          `| ${kept.includes(line) ? 'yes' : 'no'} | ${blank(line.top)} | ${blank(line.height)} ` +
+            `| ${blank(line.left)} | ${blank(line.width)} | ${cell(line.text)} |`
+        );
+      }
+      out.push('');
+      parts.push(kept.map((line) => line.text).join(' '));
+    }
+
+    out.push('## What would be stored');
+    out.push('');
+    out.push('```');
+    out.push(collapseWhitespace(parts.join(' ')));
+    out.push('```');
+    out.push('');
+
+    const path = 'Minimal PDF annotator selection report.md';
+    const body = out.join('\n');
+    const existing = this.app.vault.getAbstractFileByPath(path);
+    if (existing instanceof TFile) await this.app.vault.modify(existing, body);
+    else await this.app.vault.create(path, body);
+    await this.app.workspace.openLinkText(path, '', true);
+  }
+
+  /* --------------------------------------------------------- note popovers */
+
+  /* One note box exists at a time, anchored to whatever was clicked. `commit`
+     is handed the textarea's text; returning nothing means no change. */
+  openNoteBox(anchor, initial, onCommit) {
+    this.closeNoteBox();
+
+    const box = document.body.createDiv({ cls: 'mpa-note-box' });
+    const handle = box.createDiv({ cls: 'mpa-note-handle' });
+    handle.setAttribute('aria-label', 'Drag to move');
+    const textarea = box.createEl('textarea', {
+      attr: { placeholder: `${Platform.isMacOS ? 'Cmd' : 'Ctrl'}+Enter to save, Esc to close` },
+    });
+    textarea.value = initial;
+
+    /* Its own undo, so the keys group typing the way they do everywhere else
+       in Obsidian rather than stepping one character at a time. */
+    const history = new NoteHistory(textarea);
+    this.noteHistory = history;
+    textarea.addEventListener('input', () => history.record(Date.now()));
+
+    /* Measured now that the box is in the page, so it can be kept on screen. */
+    const size = () => ({ width: box.offsetWidth, height: box.offsetHeight });
+    const viewport = () => ({ width: window.innerWidth, height: window.innerHeight });
+    let at = placeBox(anchor, size(), viewport());
+    const moveTo = (left, top) => {
+      at = clampToViewport(left, top, size(), viewport());
+      box.style.setProperty('--mpa-note-x', at.left + 'px');
+      box.style.setProperty('--mpa-note-y', at.top + 'px');
+    };
+    moveTo(at.left, at.top);
+
+    /* Dragged by its handle, for when the box covers something the reader
+       wants to see anyway.
+
+       The listeners go on the document, since the pointer leaves the handle
+       during a drag, and in the capture phase, since the box stops mouse
+       events from travelling further and would otherwise swallow the release
+       that ends the drag.
+
+       mousedown is prevented rather than allowed, which keeps focus in the
+       textarea. Letting focus go would blur it, and a blur saves and closes
+       the box, so the note would be filed away the moment you tried to move
+       it. */
+    const drag = new BoxDrag(moveTo);
+    const onMove = (e) => {
+      if (!drag.move(e.clientX, e.clientY, e.buttons)) detach();
+    };
+    const stopDrag = () => {
+      drag.stop();
+      detach();
+    };
+    function detach() {
+      document.removeEventListener('mousemove', onMove, true);
+      document.removeEventListener('mouseup', stopDrag, true);
+    }
+    handle.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      drag.start(e.clientX, e.clientY, at.left, at.top);
+      document.addEventListener('mousemove', onMove, true);
+      document.addEventListener('mouseup', stopDrag, true);
+    });
+    /* Each box settles exactly once. Removing it can blur the textarea, so
+       without this a discard on Esc would be undone by a save on blur, and a
+       box closed to make room for another would reach past itself and close
+       the replacement instead. */
+    let settled = false;
+    const finish = (save) => {
+      if (settled) return;
+      settled = true;
+      const value = textarea.value.trim();
+      if (this.noteBox === box) this.noteBox = null;
+      if (this.noteHistory === history) this.noteHistory = null;
+      stopDrag();
+      box.remove();
+      if (save) onCommit(value);
+    };
+    /* Lets closeNoteBox() retire this box without a save. */
+    box.mpaSettle = () => {
+      settled = true;
+      stopDrag();
+    };
+
+    textarea.addEventListener('blur', () => finish(true));
+    textarea.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        finish(false);
+      } else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        finish(true);
+      }
+    });
+    /* Keep the page handlers underneath from reacting to the box itself. */
+    for (const type of ['mousedown', 'mouseup', 'click', 'contextmenu']) {
+      box.addEventListener(type, (e) => e.stopPropagation());
+    }
+
+    this.noteBox = box;
+    textarea.focus();
+  }
+
+  closeNoteBox() {
+    const box = this.noteBox;
+    if (!box) return;
+    this.noteBox = null;
+    this.noteHistory = null;
+    box.mpaSettle();
+    box.remove();
+  }
+
+  /* Where a note box should appear: just below the thing the note belongs to.
+
+     Resolved here, when the box opens, rather than being carried from the
+     click that asked for it. A context-menu item runs after the menu has
+     closed, and by then a redraw may have replaced the element that was under
+     the pointer. A detached element measures as nothing, which put the box in
+     the top-left corner of the window. Looking the element up again by id
+     means the two ways of asking for a note behave identically.
+
+     The box goes below the whole of what it belongs to, so the words stay
+     readable while the note is being written. */
+  anchorFor(state, selector) {
+    /* Every piece of it, so a highlight running over several lines is cleared
+       in full rather than only its first line. */
+    let union = null;
+    for (const el of state.container.querySelectorAll(selector)) {
+      const rect = el.getBoundingClientRect();
+      if (!rect.width && !rect.height) continue;
+      if (!union) union = { left: rect.left, top: rect.top, bottom: rect.bottom };
+      else {
+        union.left = Math.min(union.left, rect.left);
+        union.top = Math.min(union.top, rect.top);
+        union.bottom = Math.max(union.bottom, rect.bottom);
+      }
+    }
+    if (union) return union;
+    /* The thing is not on screen, so fall back to the pointer, and failing
+       that to the top of the view. */
+    const pointer = this.pointers.up || this.pointers.down;
+    if (pointer) return { left: pointer.x, top: pointer.y, bottom: pointer.y };
+    const box = state.container.getBoundingClientRect();
+    return { left: box.left + 20, top: box.top + 20, bottom: box.top + 20 };
+  }
+
+  openHighlightNote(state, id) {
+    if (!this.canEdit(state.doc)) return;
+    const highlight = state.doc.data.highlights.find((h) => h.id === id);
+    if (!highlight) return;
+    const anchor = this.anchorFor(state, `.mpa-highlight[data-highlight-id="${id}"]`);
+    this.openNoteBox(anchor, highlight.note || '', (value) => {
+      if ((highlight.note || '') === value) return;
+      highlight.note = value;
+      this.commit(state.doc, value ? 'editing a note' : 'removing a note');
+    });
+  }
+
+  openStandaloneNote(state, id) {
+    if (!this.canEdit(state.doc)) return;
+    const note = state.doc.data.notes.find((n) => n.id === id);
+    if (!note) return;
+    const anchor = this.anchorFor(state, `.mpa-note-icon[data-note-id="${id}"]`);
+    this.openNoteBox(anchor, note.text || '', (value) => {
+      if (!value) {
+        /* Emptying a standalone note deletes it: there is nothing left to
+           anchor its icon to. */
+        state.doc.data.notes = state.doc.data.notes.filter((n) => n.id !== note.id);
+      } else if (value === note.text) {
+        return;
+      } else {
+        note.text = value;
+      }
+      this.commit(state.doc, value ? 'editing a note' : 'removing a note');
+    });
+  }
+
+  addStandaloneNote(state, e, pageEl) {
+    if (!this.canEdit(state.doc)) return;
+    const pageRect = pageEl.getBoundingClientRect();
+    if (!pageRect.width || !pageRect.height) return;
+    const position = {
+      x: (e.clientX - pageRect.left) / pageRect.width,
+      y: (e.clientY - pageRect.top) / pageRect.height,
+    };
+    const page = pageNumberOf(pageEl);
+
+    this.openNoteBox({ left: e.clientX, top: e.clientY, bottom: e.clientY }, '', (value) => {
+      if (!value) return;
+      state.doc.data.notes.push({
+        id: uuid(),
+        page,
+        text: value,
+        position,
+        createdAt: new Date().toISOString(),
+      });
+      this.commit(state.doc, 'adding a note');
+    });
+  }
+
+  /* -------------------------------------------------------------- drawing */
+
+  render(state) {
+    if (!state.doc || !this.views.has(state.view)) return;
+    /* Outside withoutObserver, so that the page rebuild a zoom change causes
+       is seen and the overlays are drawn again at the new scale. */
+    this.syncZoom(state);
+    this.withoutObserver(state, () => {
+      this.drawToolbarButton(state);
+      this.drawHighlights(state);
+    });
+  }
+
+  drawHighlights(state) {
+    const { highlights, notes } = state.doc.data;
+
+    /* A highlight can span pages, so its rectangles are bucketed by the page
+       they belong to. Its note marker goes on whichever page its first
+       rectangle is on. */
+    const byPage = new Map();
+    const bucket = (page) => {
+      if (!byPage.has(page)) byPage.set(page, { rects: [], icons: [] });
+      return byPage.get(page);
+    };
+
+    for (const highlight of highlights) {
+      const color = HEX_COLOR_RE.test(highlight.color || '')
+        ? highlight.color
+        : this.settings.highlightColor;
+      for (const rect of highlight.rects || []) {
+        bucket(rect.page).rects.push({ highlight, rect, color });
+      }
+      const first = firstRect(highlight);
+      if (highlight.note && first) {
+        /* In the margin, level with the middle of the highlight's first line,
+           so the marker never sits over the words it belongs to. */
+        bucket(first.page).icons.push({
+          id: highlight.id,
+          kind: 'highlight',
+          y: first.y + (first.h || 0) / 2,
+          inMargin: true,
+          color,
+        });
+      }
+    }
+    for (const note of notes) {
+      /* Also in the margin, level with the point it was put at. Keeping the
+         marker where the page was right-clicked meant it sat on top of the
+         words there, which is the thing the margin exists to avoid. Where it
+         was put is still recorded, and still decides its place in the
+         transcript; only the marker moves. */
+      const position = note.position || { x: 0, y: 0 };
+      bucket(note.page).icons.push({
+        id: note.id,
+        kind: 'note',
+        y: position.y,
+        inMargin: true,
+        color: this.settings.highlightColor,
+      });
+    }
+
+    for (const pageEl of state.container.querySelectorAll('.page')) {
+      const items = byPage.get(pageNumberOf(pageEl));
+      let layer = pageEl.querySelector(':scope > .mpa-layer');
+
+      if (!items || (!items.rects.length && !items.icons.length)) {
+        if (layer) layer.remove();
+        continue;
+      }
+      if (!layer) layer = pageEl.createDiv({ cls: 'mpa-layer' });
+      layer.empty();
+
+      for (const { highlight, rect, color } of items.rects) {
+        const el = layer.createDiv({ cls: 'mpa-highlight' });
+        el.dataset.highlightId = highlight.id;
+        el.style.setProperty('--mpa-x', pct(rect.x));
+        el.style.setProperty('--mpa-y', pct(rect.y));
+        el.style.setProperty('--mpa-w', pct(rect.w));
+        el.style.setProperty('--mpa-h', pct(rect.h));
+        el.style.setProperty('--mpa-color', color);
+      }
+
+      for (const item of items.icons) {
+        /* Only the vertical position comes from script. The margin placement
+           is in the stylesheet, so there is one rule for every marker. */
+        const icon = this.createNoteIcon(layer, item.id, item.kind, item.color);
+        icon.style.setProperty('--mpa-y', pct(item.y));
+      }
+    }
+  }
+
+  createNoteIcon(layer, id, kind, color) {
+    const el = layer.createDiv({ cls: 'mpa-note-icon' });
+    el.dataset.noteId = id;
+    el.dataset.noteKind = kind;
+    el.setAttribute('aria-label', kind === 'note' ? 'Open note' : 'Open highlight note');
+    el.style.setProperty('--mpa-color', color);
+    setIcon(el, 'sticky-note');
+    return el;
+  }
+
+  /* A highlighter button in the PDF viewer's own toolbar, so the mode can be
+     reached without the ribbon or the status bar. */
+  drawToolbarButton(state) {
+    const toolbar =
+      state.container.querySelector('.pdf-toolbar') ||
+      state.container.querySelector('.pdf-toolbar-container') ||
+      state.container.querySelector('.pdf-container') ||
+      state.container;
+    const floating = !toolbar.matches('.pdf-toolbar, .pdf-toolbar-container');
+
+    let btn = toolbar.querySelector(':scope > .mpa-toolbar-btn');
+    if (!btn) {
+      /* A stale button from an earlier layout, now in the wrong container. */
+      state.container.querySelectorAll('.mpa-toolbar-btn').forEach((el) => el.remove());
+      btn = toolbar.createDiv({ cls: 'mpa-toolbar-btn clickable-icon' });
+      btn.setAttribute('aria-label', 'Toggle PDF highlight mode');
+      setIcon(btn, 'highlighter');
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.toggleHighlightMode();
+      });
+    }
+    btn.toggleClass('mpa-toolbar-btn-floating', floating);
+    this.styleToolbarButton(btn);
+  }
+
+  refreshToolbarButton(state) {
+    const btn = state.container.querySelector('.mpa-toolbar-btn');
+    if (btn) this.styleToolbarButton(btn);
+  }
+
+  styleToolbarButton(btn) {
+    btn.toggleClass('is-active', this.highlightMode);
+    btn.style.setProperty('--mpa-color', this.settings.highlightColor);
+  }
+
+  /* ------------------------------------------------------------- settings */
+
+  async loadSettings() {
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    if (!HEX_COLOR_RE.test(this.settings.highlightColor)) {
+      this.settings.highlightColor = DEFAULT_SETTINGS.highlightColor;
+    }
+    this.settings.snapToWords = this.settings.snapToWords !== false;
+    this.settings.rememberZoom = this.settings.rememberZoom !== false;
+  }
+
+  async saveSettings() {
+    await this.saveData(this.settings);
+    this.applyModeColor();
+    this.updateStatusEl();
+    for (const state of this.views.values()) this.render(state);
+  }
+}
+
+/* The settings tab's explanatory text lives in a file beside the plugin, so
+   the wording can be edited without touching JavaScript. Obsidian's installer
+   only fetches main.js, manifest.json and styles.css, so the file cannot
+   simply be shipped: the text below is the source of truth, and the plugin
+   writes it out on first load if it is not already there. It is never
+   overwritten after that, so an edit survives. */
+const HELP_FILE = 'settings-help.md';
+
+const DEFAULT_HELP = `## How it works
+
+Turn on highlight mode from the ribbon, the status bar or the PDF toolbar, then
+select text in a PDF to highlight it.
+
+- **Click a highlight** to attach a note to it.
+- **Right-click a highlight** to add or edit its note, or to remove either.
+- **Right-click a blank part of a page** for "Add note", which anchors a note
+  of its own at that point.
+
+Every note is marked by a small icon in the page's left margin, level with the
+thing it refers to, so a marker never covers the text it belongs to.
+
+A note box opens below everything it belongs to, so the words stay readable
+while you write. Drag the strip along its top to move it.
+
+In a note box, Cmd or Ctrl with Enter saves, and Esc discards. Clicking away
+saves. A selection that runs across a page break is one highlight, so removing
+it removes the whole thing.
+
+A highlight covers exactly the characters it transcribes. Where a drag ends
+between two letters, the one nearer your pointer wins, and unless you turn off
+snapping above, the whole word is taken.
+
+## Undoing
+
+Cmd or Ctrl with Z steps back through the highlights and notes on the PDF you
+are looking at, and adding Shift steps forward again. The same keys keep their
+usual meaning everywhere else. Inside a note box they undo what you typed,
+grouped by pauses the way the rest of Obsidian groups it.
+
+They cannot be rebound. The keys are caught by the plugin rather than
+registered in Obsidian's hotkey settings, because a hotkey bound to this key
+would stop the editor's own undo working everywhere. There are also two
+commands, **Undo last annotation change** and **Redo last undone annotation
+change**, which you can reach from the command palette or give a second key of
+your own.
+
+The history goes fifty changes back per PDF, lives in memory, and is lost when
+Obsidian restarts. It is also cleared if the annotations file changes from
+outside the plugin, by a sync for instance, since by then it describes a
+document that no longer exists.
+
+## Zoom
+
+Each PDF reopens at the zoom you last read it at. This is kept per device,
+since a comfortable zoom depends on the screen in front of you, so it is not
+carried between machines. Turn it off in the settings above to have every PDF
+open at Obsidian's own default.
+
+## Where your annotations live
+
+Two files sit beside each PDF. For \`refs/paper.pdf\` you get:
+
+**\`refs/paper.annotations.json\`** holds the annotations, and is the only copy
+of them. Keep it alongside the PDF when you move things around.
+
+**\`refs/paper.md\`** is a transcript of them, so highlights are searchable and
+linkable as ordinary markdown. It is regenerated on every change, so edits to it
+are not read back and will be replaced.
+
+If a note of your own is already at that path, it is left untouched and no
+transcript is written. Your highlights are still safe in the JSON file.
+
+## When a highlight comes out wrong
+
+Run the command **Report what the current selection looks like** with the
+problem text selected. It writes a note describing what the viewer reports for
+every span in the selection, which is what explains the result.
+
+---
+
+*This text lives in \`${HELP_FILE}\` in the plugin folder, so you can edit it.
+Reopen this tab to see your changes. The plugin only ever creates that file, so
+your wording is kept.*
+`;
+
+class MinimalPdfAnnotatorSettingTab extends PluginSettingTab {
+  constructor(app, plugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+
+  display() {
+    const { containerEl } = this;
+    containerEl.empty();
+
+    new Setting(containerEl)
+      .setName('Remember each PDF\u2019s zoom level')
+      .setDesc(
+        'Reopen a PDF at the zoom you last read it at. Kept per device, since a comfortable ' +
+          'zoom depends on the screen, so it is not carried between machines.'
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.rememberZoom).onChange(async (value) => {
+          this.plugin.settings.rememberZoom = value;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName('Snap highlights to whole words')
+      .setDesc(
+        'A PDF viewer stretches its text to match the document, so dragging to the end of a ' +
+          'word often stops one letter short. With this on, a highlight is widened to the ' +
+          'words it covers. Turn it off to keep exactly what you selected.'
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.snapToWords).onChange(async (value) => {
+          this.plugin.settings.snapToWords = value;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName('Highlight colour')
+      .setDesc('Used for new highlights. Existing ones keep the colour they were made with.')
+      .addColorPicker((picker) =>
+        picker.setValue(this.plugin.settings.highlightColor).onChange(async (value) => {
+          if (!HEX_COLOR_RE.test(value)) return;
+          this.plugin.settings.highlightColor = value;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    /* Reading the file is asynchronous and display() is not, so the text is
+       rendered into a container that is already in place. */
+    const help = containerEl.createDiv({ cls: 'mpa-help' });
+    this.renderHelp(help).catch((e) => {
+      this.plugin.report(`could not render ${HELP_FILE}`, e);
+      help.empty();
+      help.createEl('p', {
+        text: 'Turn on highlight mode from the ribbon, the status bar or the PDF toolbar, then select text in a PDF to highlight it.',
+        cls: 'setting-item-description',
+      });
+    });
+  }
+
+  async renderHelp(el) {
+    const markdown = await this.plugin.loadHelpText();
+    el.empty();
+    /* render() replaced renderMarkdown() during the 1.5 series; accept either
+       so the stated minimum app version holds. */
+    if (MarkdownRenderer.render) {
+      await MarkdownRenderer.render(this.app, markdown, el, '', this.plugin);
+    } else {
+      await MarkdownRenderer.renderMarkdown(markdown, el, '', this.plugin);
+    }
+  }
+}
+
+/* ----------------------------------------------------------------- helpers */
+
+function round(n) {
+  return Math.round(n * 10) / 10;
+}
+
+function describePoint(point) {
+  return point ? `${round(point.x)}, ${round(point.y)}` : 'not recorded';
+}
+
+function charAt(chars, index) {
+  return index >= 0 && index < chars.length ? chars[index].ch : '';
+}
+
+function blank(n) {
+  return n === null || n === undefined ? '' : round(n);
+}
+
+function cell(text) {
+  return String(text).replace(/\|/g, '\\|').replace(/\n/g, ' ');
+}
+
+function pct(n) {
+  return (typeof n === 'number' && isFinite(n) ? n * 100 : 0) + '%';
+}
+
+function pageNumberOf(pageEl) {
+  const n = parseInt(pageEl.dataset.pageNumber || '', 10);
+  return Number.isInteger(n) ? n : 1;
+}
+
+function uuid() {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+  /* Only reached in a context without the Web Crypto API. Uniqueness within
+     one PDF's annotations is all that is asked of it. */
+  return 'mpa-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+}
+
+/* Keeps a box inside the window, with a margin. Shared by the opening
+   placement and by dragging, so a box cannot be left somewhere it cannot be
+   reached. */
+const BOX_MARGIN = 8;
+const BOX_GAP = 6;
+
+function clampToViewport(left, top, size, viewport) {
+  const widest = Math.max(BOX_MARGIN, viewport.width - size.width - BOX_MARGIN);
+  const tallest = Math.max(BOX_MARGIN, viewport.height - size.height - BOX_MARGIN);
+  return {
+    left: Math.round(Math.min(Math.max(left, BOX_MARGIN), widest)),
+    top: Math.round(Math.min(Math.max(top, BOX_MARGIN), tallest)),
+  };
+}
+
+/* Where a note box opens: below everything it belongs to, so the words it
+   refers to stay readable. A highlight near the bottom of the window would
+   push the box out of view, so it flips above instead when there is no room
+   beneath. Pure, so the arithmetic can be checked without a window. */
+function placeBox(anchor, size, viewport) {
+  let top = anchor.bottom + BOX_GAP;
+  if (top + size.height + BOX_MARGIN > viewport.height) {
+    const above = anchor.top - size.height - BOX_GAP;
+    if (above >= BOX_MARGIN) top = above;
+  }
+  return clampToViewport(anchor.left, top, size, viewport);
+}
+
+/* Whether a stored zoom is something the viewer will accept, so a stale or
+   hand-edited value cannot put a PDF into a strange state. */
+function validZoom(value) {
+  if (typeof value !== 'string' || !value) return false;
+  if (ZOOM_WORDS.includes(value)) return true;
+  const scale = Number(value);
+  return Number.isFinite(scale) && scale >= 0.1 && scale <= 10;
+}
+
+/* The viewer behind a PDF view, or null.
+
+   This reaches through Obsidian's PDF view into the PDF.js viewer it wraps,
+   which is not part of the plugin API, so every step is checked and a shape we
+   do not recognise simply means the zoom is not remembered. Nothing else
+   depends on it. */
+function pdfViewerOf(view) {
+  const child = view && view.viewer && view.viewer.child;
+  const wrapper = child && child.pdfViewer;
+  const viewer = wrapper && wrapper.pdfViewer;
+  return viewer && typeof viewer.currentScaleValue === 'string' ? viewer : null;
+}
+
+/* Keeps the most recently used entries and drops the rest. Objects keep their
+   keys in insertion order, and a remembered zoom is deleted before being set
+   again, so the order is least recently used first. */
+function pruneZooms(zooms, limit) {
+  const paths = Object.keys(zooms);
+  for (const path of paths.slice(0, Math.max(0, paths.length - limit))) delete zooms[path];
+  return zooms;
+}
+
+/* A drag of the note box, in progress.
+
+   Kept apart from the event wiring so the rules can be checked without a
+   mouse. There are two of them, and both exist because a release can go
+   missing: the box stops mouse events from travelling further, to keep the
+   page handlers underneath from reacting to it, and a button let go outside
+   the window is never reported at all. So a move with no button held ends the
+   drag, and a move after it has ended does nothing. */
+class BoxDrag {
+  constructor(onMove) {
+    this.onMove = onMove;
+    this.from = null;
+  }
+
+  get active() {
+    return this.from !== null;
+  }
+
+  start(x, y, left, top) {
+    this.from = { x, y, left, top };
+  }
+
+  /* Returns whether the drag is still live afterwards. */
+  move(x, y, buttons) {
+    if (!this.from) return false;
+    if (!buttons) {
+      this.stop();
+      return false;
+    }
+    this.onMove(this.from.left + (x - this.from.x), this.from.top + (y - this.from.y));
+    return true;
+  }
+
+  stop() {
+    const was = this.active;
+    this.from = null;
+    return was;
+  }
+}
+
+/* Undo inside a note box.
+
+   A textarea comes with the browser's own undo, which steps through a typed
+   run one character at a time. The rest of Obsidian does not behave that way:
+   CodeMirror starts a new undo step only when you pause, so a burst of typing
+   comes back as a burst. Rather than leave the note box feeling foreign, this
+   keeps its own history using CodeMirror's rule.
+
+   The delay is CodeMirror's own default. */
+const NOTE_GROUP_MS = 500;
+const NOTE_UNDO_LIMIT = 100;
+
+class NoteHistory {
+  constructor(el) {
+    this.el = el;
+    /* The state the current group of keystrokes started from. */
+    this.previous = this.capture();
+    this.undoStack = [];
+    this.redoStack = [];
+    this.lastAt = 0;
+  }
+
+  capture() {
+    return { value: this.el.value, caret: this.el.selectionEnd };
+  }
+
+  /* Called after every change to the text. A new undo step begins only when
+     the typing has paused; otherwise this keystroke joins the one before it. */
+  record(at) {
+    if (at - this.lastAt >= NOTE_GROUP_MS) {
+      this.undoStack.push(this.previous);
+      while (this.undoStack.length > NOTE_UNDO_LIMIT) this.undoStack.shift();
+      this.redoStack.length = 0;
+    }
+    this.lastAt = at;
+    this.previous = this.capture();
+  }
+
+  undo() {
+    return this.step(this.undoStack, this.redoStack);
+  }
+
+  redo() {
+    return this.step(this.redoStack, this.undoStack);
+  }
+
+  step(from, to) {
+    if (!from.length) return false;
+    const entry = from.pop();
+    to.push(this.capture());
+    this.el.value = entry.value;
+    if (this.el.setSelectionRange) this.el.setSelectionRange(entry.caret, entry.caret);
+    this.previous = { value: entry.value, caret: entry.caret };
+    /* Whatever is typed next starts a group of its own. */
+    this.lastAt = 0;
+    return true;
+  }
+}
+
+/* A copy of the annotations as they stand, for the undo history.
+
+   Deliberately the whole lot rather than a description of what changed. A
+   PDF's annotations are a few kilobytes, so copying them is cheap, and a
+   restore that puts back a known-good state cannot get the bookkeeping wrong
+   the way an inverse operation can.
+
+   markdownStamp is left out on purpose. It records whether the generated
+   markdown file is still the one this plugin wrote, which is a fact about the
+   file on disk, not about the annotations. Restoring an old one would make the
+   plugin think somebody else's note had appeared at that path and stop writing
+   the transcript. */
+function snapshot(data) {
+  return {
+    highlights: JSON.parse(JSON.stringify(data.highlights || [])),
+    notes: JSON.parse(JSON.stringify(data.notes || [])),
+  };
+}
+
+/* FNV-1a over the text, with the length appended. Enough to answer "is this
+   file still the one we wrote", which is all it is used for. */
+function stamp(text) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return `${(h >>> 0).toString(16)}-${text.length}`;
+}
+
+/* The box an absolutely positioned child with `inset: 0` is laid out against:
+   the page's padding box.
+
+   This is not getBoundingClientRect(). Obsidian gives .page a transparent
+   border that scales with the zoom level, and the bounding rect includes it
+   while our overlay layer is positioned inside it. Measuring against the outer
+   box put every highlight a few pixels off centre and left a gap at the start
+   and end of each line, widening as you zoomed in. */
+function pagePaddingBox(pageEl) {
+  const rect = pageEl.getBoundingClientRect();
+  const style = getComputedStyle(pageEl);
+  const left = parseFloat(style.borderLeftWidth) || 0;
+  const right = parseFloat(style.borderRightWidth) || 0;
+  const top = parseFloat(style.borderTopWidth) || 0;
+  const bottom = parseFloat(style.borderBottomWidth) || 0;
+  const width = rect.width - left - right;
+  const height = rect.height - top - bottom;
+  if (width <= 0 || height <= 0) return null;
+  return { left: rect.left + left, top: rect.top + top, width, height };
+}
+
+/* ------------------------------------------------------- the character model
+
+   A highlight is cut from one array of characters, each carrying the rectangle
+   the browser reports for it. The text stored and the rectangles drawn are
+   both slices of that array, so they cannot describe different characters.
+
+   The earlier design read the text from character offsets and the rectangles
+   from the browser's own selection geometry. Those are two answers to the same
+   question, and they disagreed by a glyph: a highlight would stretch over a
+   full stop the transcript left out, or the transcript would carry one the
+   highlight did not cover. Zotero avoids this by keeping its own character
+   positions and taking both answers from one of them. This is the same idea,
+   measured through the DOM instead of through the PDF's font metrics. */
+
+/* The text nodes of one page's text layer that a range touches, plus one on
+   either side. The margin matters because a boundary gets nudged below, and
+   may land just outside the nodes the browser thought were involved. */
+function involvedNodes(range, textLayer) {
+  const all = [];
+  const walker = document.createTreeWalker(textLayer, NodeFilter.SHOW_TEXT);
+  let node;
+  while ((node = walker.nextNode()) !== null) all.push(node);
+
+  let first = -1;
+  let last = -1;
+  for (let i = 0; i < all.length; i++) {
+    if (!range.intersectsNode(all[i])) continue;
+    if (first === -1) first = i;
+    last = i;
+  }
+  if (first === -1) return { nodes: [], touched: new Set() };
+
+  const nodes = all.slice(Math.max(0, first - 1), Math.min(all.length, last + 2));
+  const touched = new Set(all.slice(first, last + 1));
+  return { nodes, touched };
+}
+
+/* Every character of those nodes, with its own rectangle. One Range is reused
+   for the measuring, and nothing is mutated in between, so the whole array
+   costs a single layout. */
+function buildChars(involved) {
+  const chars = [];
+  const measure = document.createRange();
+
+  for (const node of involved.nodes) {
+    const value = node.nodeValue || '';
+    const placed = measurable(node).ok;
+    const touched = involved.touched.has(node);
+    for (let i = 0; i < value.length; i++) {
+      measure.setStart(node, i);
+      measure.setEnd(node, i + 1);
+      chars.push({
+        ch: value[i],
+        node,
+        touched,
+        box: placed ? unionRect(measure.getClientRects()) : null,
+      });
+    }
+  }
+  return chars;
+}
+
+/* Two characters are on the same line when their vertical centres are within
+   roughly half a line height of each other. Used to stop anything reaching
+   across a line break, where a PDF leaves no space character to stop at. */
+function sameLine(a, b) {
+  if (!a || !b || !a.box || !b.box) return false;
+  const centreA = (a.box.top + a.box.bottom) / 2;
+  const centreB = (b.box.top + b.box.bottom) / 2;
+  const height = Math.min(a.box.bottom - a.box.top, b.box.bottom - b.box.top);
+  return Math.abs(centreA - centreB) <= Math.max(3, height * 0.6);
+}
+
+/* Where a boundary between two characters sits on the screen. */
+function boundaryPosition(chars, index) {
+  const before = index > 0 ? chars[index - 1] : null;
+  const after = index < chars.length ? chars[index] : null;
+  if (before && before.box) {
+    return { x: before.box.right, top: before.box.top, bottom: before.box.bottom };
+  }
+  if (after && after.box) {
+    return { x: after.box.left, top: after.box.top, bottom: after.box.bottom };
+  }
+  return null;
+}
+
+/* The index in `chars` of a range or selection boundary, or -1 when that
+   boundary is not in this page's characters at all. */
+function indexOfBoundary(chars, container, offset) {
+  if (!container || container.nodeType !== 3) return -1;
+  for (let i = 0; i < chars.length; i++) {
+    if (chars[i].node === container) return i + Math.min(offset, (container.nodeValue || '').length);
+  }
+  return -1;
+}
+
+/* The first and last boundary of the part of the selection that lies on this
+   page, for when one or both of its ends are on another page. */
+function touchedBounds(chars) {
+  let from = -1;
+  let to = -1;
+  for (let i = 0; i < chars.length; i++) {
+    if (!chars[i].touched) continue;
+    if (from === -1) from = i;
+    to = i + 1;
+  }
+  return from === -1 ? null : { from, to };
+}
+
+const BOUNDARY_WINDOW = 4;
+
+/* Moves a boundary to whichever nearby one is actually closest to the pointer.
+
+   The viewer stretches each span of text horizontally to match the document's
+   own letter spacing, and the browser picks a character boundary using the
+   unstretched metrics, so its answer can sit a glyph away from where the
+   pointer was. Comparing the pointer against the real positions of the
+   boundaries around it puts that right, and is why a full stop is now either
+   highlighted and transcribed or neither. */
+function refineBoundary(chars, index, point) {
+  if (!point || index < 0) return index;
+  const lo = Math.max(0, index - BOUNDARY_WINDOW);
+  const hi = Math.min(chars.length, index + BOUNDARY_WINDOW);
+
+  let best = index;
+  let bestDistance = Infinity;
+  for (let i = lo; i <= hi; i++) {
+    const at = boundaryPosition(chars, i);
+    /* Only boundaries on the pointer's own line are candidates. */
+    if (!at || point.y < at.top - 2 || point.y > at.bottom + 2) continue;
+    const distance = Math.abs(at.x - point.x);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = i;
+    }
+  }
+  return best;
+}
+
+/* Which of the drag's two ends to judge a boundary against. A drag made
+   backwards, or one whose other end is on another page, sorts itself out. */
+function nearestPointer(chars, index, pointers) {
+  const at = boundaryPosition(chars, index);
+  if (!at) return null;
+  const distance = (p) =>
+    p ? Math.abs(at.x - p.x) + Math.abs((at.top + at.bottom) / 2 - p.y) : Infinity;
+  const down = distance(pointers.down);
+  const up = distance(pointers.up);
+  if (down === Infinity && up === Infinity) return null;
+  return down <= up ? pointers.down : pointers.up;
+}
+
+const WORD_CHAR_RE = /[\p{L}\p{N}'’]/u;
+
+function isWordChar(char) {
+  return !!char && WORD_CHAR_RE.test(char.ch);
+}
+
+/* Whether a boundary falls strictly inside a word, with a word character on
+   both sides of it and both on the same line. A boundary already in the
+   whitespace between two words is left alone: widening it would reach into the
+   word next door, so starting a drag in the gap before a word would silently
+   take the word before that as well. */
+function insideWord(chars, index) {
+  if (index <= 0 || index >= chars.length) return false;
+  const before = chars[index - 1];
+  const after = chars[index];
+  return isWordChar(before) && isWordChar(after) && sameLine(before, after);
+}
+
+/* Widens a boundary so it does not sit in the middle of a word. */
+function snapStart(chars, index) {
+  let i = index;
+  if (!insideWord(chars, i)) return i;
+  while (i > 0 && isWordChar(chars[i - 1]) && sameLine(chars[i - 1], chars[i])) i--;
+  return i;
+}
+
+function snapEnd(chars, index) {
+  let i = index;
+  if (!insideWord(chars, i)) return i;
+  while (i < chars.length && isWordChar(chars[i]) && sameLine(chars[i - 1], chars[i])) i++;
+  return i;
+}
+
+/* The slice of `chars` this page contributes to the highlight. */
+function selectedSlice(chars, range, pointers, snap) {
+  const bounds = touchedBounds(chars);
+  if (!bounds) return null;
+
+  let from = bounds.from;
+  let to = bounds.to;
+
+  const startIndex = indexOfBoundary(chars, range.startContainer, range.startOffset);
+  if (startIndex !== -1) from = refineBoundary(chars, startIndex, nearestPointer(chars, startIndex, pointers));
+  const endIndex = indexOfBoundary(chars, range.endContainer, range.endOffset);
+  if (endIndex !== -1) to = refineBoundary(chars, endIndex, nearestPointer(chars, endIndex, pointers));
+
+  if (to < from) {
+    const swap = from;
+    from = to;
+    to = swap;
+  }
+  if (snap) {
+    from = snapStart(chars, from);
+    to = snapEnd(chars, to);
+  }
+  from = Math.max(0, from);
+  to = Math.min(chars.length, to);
+  return to > from ? { from, to } : null;
+}
+
+/* The selected characters grouped into lines, each with the rectangle covering
+   it and the text it reads as. A character the viewer gives no position to
+   contributes its text to whichever line is being built; if it sits between
+   two that do have positions, the line's rectangle covers it anyway. */
+function linesFromChars(chars, from, to) {
+  const lines = [];
+  let current = null;
+
+  for (let i = from; i < to; i++) {
+    const char = chars[i];
+    if (!char.box) {
+      if (!current) lines.push((current = { box: null, chars: [] }));
+      current.chars.push(char);
+      continue;
+    }
+
+    const centre = (char.box.top + char.box.bottom) / 2;
+    const height = char.box.bottom - char.box.top;
+    const fits =
+      current &&
+      current.box &&
+      Math.abs(centre - (current.box.top + current.box.bottom) / 2) <=
+        Math.max(3, Math.min(current.box.bottom - current.box.top, height) * 0.6);
+
+    if (!fits) {
+      lines.push((current = { box: Object.assign({}, char.box), chars: [char] }));
+      continue;
+    }
+    current.box.left = Math.min(current.box.left, char.box.left);
+    current.box.right = Math.max(current.box.right, char.box.right);
+    current.box.top = Math.min(current.box.top, char.box.top);
+    current.box.bottom = Math.max(current.box.bottom, char.box.bottom);
+    current.chars.push(char);
+  }
+
+  return lines.map((line) => ({
+    text: textOfChars(line.chars),
+    left: line.box ? line.box.left : null,
+    top: line.box ? line.box.top : null,
+    width: line.box ? line.box.right - line.box.left : null,
+    height: line.box ? line.box.bottom - line.box.top : null,
+  }));
+}
+
+/* A PDF's text layer carries no spaces between its spans, so where two spans
+   sit apart on the page the gap between them was a space on the page too.
+   Reading the text without putting those back ran words together: "in
+   theexperience of loneliness". Characters within one span are taken as they
+   come, since the viewer stretches a span's letters apart and the gaps inside
+   it say nothing. */
+function textOfChars(chars) {
+  let out = '';
+  let previous = null;
+  for (const char of chars) {
+    if (previous && previous.node !== char.node && previous.box && char.box) {
+      const gap = char.box.left - previous.box.right;
+      const height = Math.min(
+        previous.box.bottom - previous.box.top,
+        char.box.bottom - char.box.top
+      );
+      const spaced = /\s$/.test(out) || /^\s/.test(char.ch);
+      if (!spaced && gap > Math.max(1, height * 0.2)) out += ' ';
+    }
+    out += char.ch;
+    previous = char;
+  }
+  return out;
+}
+
+/* Whether a text node's position on the page means anything.
+
+   Obsidian's stylesheet gives a tagged PDF's structural spans `height: 0`, and
+   pins the viewer's selection helper to the top of the page while a drag is in
+   progress. Text inside either one measures as a box in the page's top-left
+   corner, and those boxes were being drawn: two of them, one per page, on a
+   selection that crossed a page break. The text in such a span still counts.
+   Its position does not. */
+function measurable(node) {
+  const el = node.parentElement;
+  if (!el) return { ok: false, where: 'no parent element' };
+
+  const tag = el.tagName.toLowerCase();
+  const cls = el.className ? `.${String(el.className).trim().split(/\s+/).join('.')}` : '';
+  const where = tag + cls;
+
+  if (el.classList.contains('markedContent')) return { ok: false, where: `${where} (zero height)` };
+  if (el.closest('.endOfContent')) return { ok: false, where: `${where} (selection helper)` };
+  const style = getComputedStyle(el);
+  if (style.userSelect === 'none' || style.webkitUserSelect === 'none') {
+    return { ok: false, where: `${where} (not selectable)` };
+  }
+  if (parseFloat(style.height) === 0) return { ok: false, where: `${where} (zero height)` };
+  return { ok: true, where };
+}
+
+function unionRect(rectList) {
+  let out = null;
+  for (const r of rectList) {
+    if (r.width < 0.5 || r.height < 0.5) continue;
+    if (!out) out = { left: r.left, top: r.top, right: r.right, bottom: r.bottom };
+    else {
+      out.left = Math.min(out.left, r.left);
+      out.top = Math.min(out.top, r.top);
+      out.right = Math.max(out.right, r.right);
+      out.bottom = Math.max(out.bottom, r.bottom);
+    }
+  }
+  return out;
+}
+
+/* Running headers, page numbers and footers are set off from the body text by
+   whitespace. A line that sits on its own, far above or far below everything
+   else selected on the page, is one of those rather than part of the sentence
+   being highlighted.
+
+   The test is vertical, but the lines keep their reading order: a PDF may draw
+   its header at any point in the content stream, so the stray line is not
+   necessarily first or last in the selection. That is why the sort below is on
+   a copy.
+
+   Deliberately timid: at most two lines from either extreme, and only for a
+   gap of more than two and a half line heights, which is wider than any
+   paragraph break. Dropping real text would be much worse than leaving a page
+   number in, so a two-column page, where the next column begins far above the
+   end of the previous one, has to survive this untouched. It does, because
+   those lines are contiguous with each other. */
+function dropRunningHeads(lines) {
+  const measured = lines.filter((line) => line.top !== null);
+  if (measured.length < 3) return lines;
+
+  const sorted = measured.slice().sort((a, b) => a.top - b.top);
+  const heights = sorted.map((line) => line.height).sort((a, b) => a - b);
+  const limit = Math.max(heights[heights.length >> 1] * 2.5, 8);
+  const detached = (above, below) => below.top - (above.top + above.height) > limit;
+
+  const drop = new Set();
+  let lo = 0;
+  let hi = sorted.length - 1;
+  for (let n = 0; n < 2 && hi - lo >= 2; n++) {
+    if (!detached(sorted[lo], sorted[lo + 1])) break;
+    drop.add(sorted[lo++]);
+  }
+  for (let n = 0; n < 2 && hi - lo >= 2; n++) {
+    if (!detached(sorted[hi - 1], sorted[hi])) break;
+    drop.add(sorted[hi--]);
+  }
+
+  return drop.size ? lines.filter((line) => !drop.has(line)) : lines;
+}
+
+/* Highlights used to carry one page number for the whole annotation, which
+   meant a selection crossing a page break had to be stored as two separate
+   highlights and removed twice. Each rectangle now names its own page, so the
+   annotation is one thing again. Older files are brought forward on read. */
+function migrateHighlight(highlight) {
+  const rects = highlight.rects || [];
+  if (!rects.length || rects[0].page !== undefined) return highlight;
+  const page = typeof highlight.page === 'number' ? highlight.page : 1;
+  const migrated = Object.assign({}, highlight, {
+    rects: rects.map((rect) => Object.assign({ page }, rect)),
+  });
+  delete migrated.page;
+  return migrated;
+}
+
+/* Where a highlight starts: the earliest page it touches, and the topmost
+   rectangle on that page. Used for ordering it in the transcript and for
+   placing its note marker. */
+function firstRect(highlight) {
+  let best = null;
+  for (const rect of highlight.rects || []) {
+    if (!best || rect.page < best.page || (rect.page === best.page && rect.y < best.y)) best = rect;
+  }
+  return best;
+}
+
+/* The generated transcript: highlights as quoted bullets in reading order,
+   their notes indented beneath, standalone notes as plain bullets. Pure, so it
+   can be checked without a vault. */
+function renderMarkdown(data) {
+  const items = [];
+  for (const h of data.highlights || []) {
+    const first = firstRect(h);
+    items.push({ page: first ? first.page : 0, y: first ? first.y : 0, kind: 'highlight', obj: h });
+  }
+  for (const n of data.notes || []) {
+    items.push({ page: n.page || 0, y: n.position ? n.position.y : 0, kind: 'note', obj: n });
+  }
+  items.sort((a, b) => a.page - b.page || a.y - b.y);
+
+  let md = '';
+  for (const { kind, obj } of items) {
+    if (kind === 'highlight') {
+      md += `- "${collapseWhitespace(obj.text || '')}"\n`;
+      if (obj.note && obj.note.trim()) {
+        for (const line of obj.note.split(/\r?\n/)) md += `\t- ${line}\n`;
+      }
+    } else {
+      const lines = (obj.text || '').split(/\r?\n/);
+      md += lines.map((line, i) => (i === 0 ? `- ${line}` : `\t${line}`)).join('\n') + '\n';
+    }
+  }
+  return md;
+}
+
+/* A highlight's text arrives with the PDF's own line breaks in it, which are
+   an artefact of the layout rather than the sentence. */
+function collapseWhitespace(s) {
+  return s.replace(/\s+/g, ' ').trim();
+}
+
+module.exports = MinimalPdfAnnotatorPlugin;
+
+/**
+ * @typedef {Object} DocState
+ * @property {TFile} file                      the PDF
+ * @property {{highlights: any[], notes: any[], markdownStamp: string | null}} data
+ * @property {boolean} readOnly                the sidecar would not parse
+ * @property {Promise<void>} saveChain         serialises writes to the sidecar
+ * @property {boolean} markdownWarned
+ * @property {string | null} sidecarStamp      what we last wrote, to tell our
+ *                                             own saves from someone else's
+ * @property {{highlights: any[], notes: any[]}} baseline
+ * @property {{state: object, label: string}[]} undoStack
+ * @property {{state: object, label: string}[]} redoStack
+ *
+ * @typedef {Object} ViewState
+ * @property {object} view
+ * @property {HTMLElement} container
+ * @property {DocState | null} doc
+ * @property {MutationObserver | null} observer
+ * @property {number} frame                   pending animation-frame redraw
+ * @property {string | null} pendingZoom       a remembered zoom not yet applied
+ */

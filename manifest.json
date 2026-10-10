@@ -1,0 +1,10 @@
+{
+  "id": "minimal-pdf-annotator",
+  "name": "Minimal PDF annotator",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Highlight text in PDFs and add notes. Highlights are stored beside the PDF and collected into a matching markdown file.",
+  "author": "david-fcp",
+  "authorUrl": "https://github.com/david-fcp",
+  "isDesktopOnly": false
+}
