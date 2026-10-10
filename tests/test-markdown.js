@@ -49,6 +49,7 @@ const stubs = {
     Setting: class {},
     Menu: MenuStub,
     ItemView: class {},
+    FileView: class {},
     Notice: class { constructor(message) { notices.push(message); } },
     TFile,
     Platform: { isMacOS: true },
@@ -71,6 +72,7 @@ m._compile(
     "snapStart,snapEnd,selectedSlice,linesFromChars,textOfChars,snapshot,NoteHistory," +
     "annotationItems,compareOrder,findAnnotation,annotationTarget,flashing,flashElapsed,pdfInnerOf,AnnotationsView," +
     "searchWords,wordMatches,editDistance,matchesQuery,destPoint,footnoteRegion," +
+    "resolveBookPath,drmProtected,snapOffset,findQuote,validTextSize,readZip," +
     "validZoom,pdfViewerOf,pruneZooms,placeBox,clampToViewport};\n",
   P
 );
@@ -1911,6 +1913,107 @@ console.log("\n--- clampToViewport");
     eq("down the full depth", blank.top - blank.bottom, 110);
     const below = T.footnoteRegion([], view, { x: null, y: -50 });
     eq("a point below the page is kept on it", below.top > below.bottom && below.bottom === 0, true);
+  }
+
+  console.log("\n--- EPUB");
+  {
+    eq("a path beside the file", T.resolveBookPath("OEBPS/text/one.xhtml", "two.xhtml"), "OEBPS/text/two.xhtml");
+    eq("a path up a folder", T.resolveBookPath("OEBPS/text/one.xhtml", "../css/book.css"), "OEBPS/css/book.css");
+    eq("a fragment is not part of the path", T.resolveBookPath("OEBPS/text/one.xhtml", "notes.xhtml#en2"), "OEBPS/text/notes.xhtml");
+    eq("a fragment alone is the same file", T.resolveBookPath("OEBPS/text/one.xhtml", "#fn1"), "OEBPS/text/one.xhtml");
+    eq("encoded names are decoded", T.resolveBookPath("OEBPS/a.xhtml", "images/my%20picture.png"), "OEBPS/images/my picture.png");
+    eq("a path from the root", T.resolveBookPath("OEBPS/text/one.xhtml", "/OEBPS/x.css"), "OEBPS/x.css");
+
+    eq("font obfuscation is not DRM", T.drmProtected([{ algorithm: "http://www.idpf.org/2008/embedding" }, { algorithm: "http://ns.adobe.com/pdf/enc#RC" }]), false);
+    eq("encrypted text is", T.drmProtected([{ algorithm: "http://www.w3.org/2001/04/xmlenc#aes128-cbc" }]), true);
+    eq("nothing encrypted is not", T.drmProtected([]), false);
+
+    const text = "The opening claim needs a source.";
+    eq("a start inside a word moves to its beginning", T.snapOffset(text, 20, "start", true), 18);
+    eq("an end inside a word moves to its end", T.snapOffset(text, 30, "end", true), 32);
+    eq("spaces at the start are skipped", T.snapOffset(text, 17, "start", true), 18);
+    eq("spaces at the end are dropped", T.snapOffset(text, 24, "end", true), 23);
+    eq("without snapping, a start stays inside its word", T.snapOffset(text, 20, "start", false), 20);
+    eq("but still leaves spaces out", T.snapOffset(text, 17, "start", false), 18);
+    eq("an offset past the end is kept to the text", T.snapOffset(text, 999, "end", true), text.length);
+
+    eq("moved words are found", T.findQuote("aaa needs a source bbb", "needs a source", 0), { start: 4, end: 18 });
+    eq("whatever the spacing", T.findQuote("needs  a\nsource", "needs a source", 0), { start: 0, end: 15 });
+    eq("the occurrence nearest where they were", T.findQuote("x y x y x", "x", 5).start, 4);
+    eq("words that are gone are not found", T.findQuote("something else", "needs a source", 0), null);
+    eq("nor are no words", T.findQuote("text", "  ", 0), null);
+    eq("characters special to a pattern are taken as written", T.findQuote("cost (1+2)? yes", "(1+2)?", 0), { start: 5, end: 11 });
+
+    eq("a text size from the list is valid", T.validTextSize(120), true);
+    eq("one not on it is not", [T.validTextSize(123), T.validTextSize("120"), T.validTextSize(null)], [false, false, false]);
+
+    const data = {
+      highlights: [
+        hl("later chapter", [], { epub: { start: [2, 10], end: [2, 20] } }),
+        hl("first chapter, later", [], { epub: { start: [0, 500], end: [0, 520] } }),
+      ],
+      notes: [{ id: "n", text: "mine", epub: { at: [0, 100] } }],
+    };
+    eq("book annotations are in reading order: chapter, then place in it", T.annotationItems(data, "position").map((i) => i.id), ["n", "first chapter, later", "later chapter"]);
+
+    const plugin = Object.create(PluginClass.prototype);
+    const file = (p) => Object.assign(new TFile(), { path: p });
+    eq("a PDF's annotations file", plugin.getSidecarPath(file("refs/paper.pdf")), "refs/paper.annotations.json");
+    eq("a book's keeps its extension, so the two never share one", plugin.getSidecarPath(file("refs/paper.epub")), "refs/paper.epub.annotations.json");
+  }
+
+  console.log("\n--- reading a zip");
+  {
+    const zlib = require("zlib");
+    const entry = (name, text, store) => {
+      const data = Buffer.from(text);
+      const packed = store ? data : zlib.deflateRawSync(data);
+      return { name: Buffer.from(name), data, packed, method: store ? 0 : 8, crc: zlib.crc32(data) };
+    };
+    const entries = [entry("mimetype", "application/epub+zip", true), entry("OEBPS/text/one.xhtml", "<p>" + "hello ".repeat(200) + "</p>")];
+    const parts = [];
+    const dir = [];
+    let offset = 0;
+    for (const e of entries) {
+      const local = Buffer.alloc(30);
+      local.writeUInt32LE(0x04034b50, 0);
+      local.writeUInt16LE(e.method, 8);
+      local.writeUInt32LE(e.crc, 14);
+      local.writeUInt32LE(e.packed.length, 18);
+      local.writeUInt32LE(e.data.length, 22);
+      local.writeUInt16LE(e.name.length, 26);
+      parts.push(local, e.name, e.packed);
+      const c = Buffer.alloc(46);
+      c.writeUInt32LE(0x02014b50, 0);
+      c.writeUInt16LE(e.method, 10);
+      c.writeUInt32LE(e.crc, 16);
+      c.writeUInt32LE(e.packed.length, 20);
+      c.writeUInt32LE(e.data.length, 24);
+      c.writeUInt16LE(e.name.length, 28);
+      c.writeUInt32LE(offset, 42);
+      dir.push(c, e.name);
+      offset += 30 + e.name.length + e.packed.length;
+    }
+    const d = Buffer.concat(dir);
+    const end = Buffer.alloc(22);
+    end.writeUInt32LE(0x06054b50, 0);
+    end.writeUInt16LE(entries.length, 8);
+    end.writeUInt16LE(entries.length, 10);
+    end.writeUInt32LE(d.length, 12);
+    end.writeUInt32LE(offset, 16);
+    const whole = Buffer.concat([...parts, d, end]);
+    const zip = T.readZip(whole.buffer.slice(whole.byteOffset, whole.byteOffset + whole.length));
+    eq("its files are listed", zip.names(), ["mimetype", "OEBPS/text/one.xhtml"]);
+    eq("a stored file is read", await zip.text("mimetype"), "application/epub+zip");
+    eq("a compressed one is unpacked", (await zip.text("OEBPS/text/one.xhtml")).length, 7 + 6 * 200);
+    eq("a missing one is nothing", await zip.text("nope"), null);
+    let threw = false;
+    try {
+      T.readZip(new ArrayBuffer(10));
+    } catch (e) {
+      threw = true;
+    }
+    eq("something that is not a zip is refused", threw, true);
   }
 
   console.log(`\n${pass} passed, ${fail} failed`);

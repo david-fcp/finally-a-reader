@@ -28,6 +28,7 @@ const {
   setIcon,
   normalizePath,
   ItemView,
+  FileView,
 } = require('obsidian');
 
 const DEFAULT_SETTINGS = {
@@ -65,6 +66,14 @@ const PDF_VIEW_TYPE = 'pdf';
 /* The plugin's own annotations sidebar. */
 const SIDEBAR_VIEW_TYPE = 'mpa-annotations';
 
+/* The plugin's own EPUB reader. */
+const EPUB_VIEW_TYPE = 'mpa-epub';
+
+/* An EPUB's text size, per book and per device like a PDF's zoom, as a
+   percentage of the normal size. */
+const TEXT_SIZE_STORE_KEY = 'epub-text-size';
+const TEXT_SIZES = [70, 80, 90, 100, 110, 120, 135, 150, 175, 200];
+
 class MinimalPdfAnnotatorPlugin extends Plugin {
   async onload() {
     await this.loadSettings();
@@ -98,6 +107,19 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     this.applyModeColor();
 
     this.registerView(SIDEBAR_VIEW_TYPE, (leaf) => new AnnotationsView(leaf, this));
+    this.textSizes = this.readTextSizes();
+    this.registerView(EPUB_VIEW_TYPE, (leaf) => new EpubView(leaf, this));
+    try {
+      this.registerExtensions(['epub'], EPUB_VIEW_TYPE);
+    } catch (e) {
+      /* Another plugin already opens EPUBs. */
+      this.report('could not take on .epub files; another plugin may already open them', e);
+    }
+    this.registerEvent(
+      this.app.workspace.on('css-change', () => {
+        for (const state of this.views.values()) if (state.kind === 'epub') state.view.applyTheme();
+      })
+    );
 
     this.ribbonEl = this.addRibbonIcon('highlighter', 'Toggle PDF highlight mode', () =>
       this.toggleHighlightMode()
@@ -290,6 +312,33 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     }
   }
 
+  readTextSizes() {
+    const out = {};
+    let stored = null;
+    try {
+      stored = this.app.loadLocalStorage(TEXT_SIZE_STORE_KEY);
+    } catch (e) {
+      return out;
+    }
+    if (!stored || typeof stored !== 'object') return out;
+    for (const path of Object.keys(stored)) {
+      if (validTextSize(stored[path])) out[path] = stored[path];
+    }
+    return out;
+  }
+
+  noteTextSize(path, value) {
+    if (!validTextSize(value)) return;
+    delete this.textSizes[path];
+    if (value !== 100) this.textSizes[path] = value;
+    pruneZooms(this.textSizes, ZOOM_LIMIT);
+    try {
+      this.app.saveLocalStorage(TEXT_SIZE_STORE_KEY, this.textSizes);
+    } catch (e) {
+      this.report('could not save the text size', e);
+    }
+  }
+
   noteZoom(path, value) {
     if (!this.settings.rememberZoom || !validZoom(value)) return;
     if (this.zooms[path] === value) return;
@@ -356,9 +405,36 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
       if (this.views.has(view) || !(view.file instanceof TFile)) continue;
       this.setupView(view).catch((e) => this.report('could not attach to a PDF view', e));
     }
+    /* EPUB views attach themselves once their book is ready. */
+    for (const leaf of this.app.workspace.getLeavesOfType(EPUB_VIEW_TYPE)) if (leaf.view) live.add(leaf.view);
     for (const view of Array.from(this.views.keys())) {
       if (!live.has(view)) this.teardownView(view);
     }
+    this.refreshFocus();
+  }
+
+  /* An EPUB view, once its book is laid out, joins the PDF views: undo, the
+     sidebar and redrawing all work through the same map. */
+  async attachEpub(view) {
+    const state = { kind: 'epub', view, container: view.containerEl, doc: null, observer: null, frame: 0, pendingZoom: null };
+    this.views.set(view, state);
+    try {
+      state.doc = await this.loadDoc(view.file);
+    } catch (e) {
+      this.views.delete(view);
+      throw e;
+    }
+    if (this.views.get(view) !== state) return null;
+    for (const other of this.views.values()) {
+      if (other.doc === state.doc) this.render(other);
+    }
+    this.refreshFocus();
+    this.maybeOpenSidebar();
+    return state;
+  }
+
+  detachEpub(view) {
+    if (this.views.has(view)) this.teardownView(view);
     this.refreshFocus();
   }
 
@@ -443,8 +519,12 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
 
   /* ------------------------------------------------------ paths and the IO */
 
-  getSidecarPath(pdfFile) {
-    return pdfFile.path.replace(/\.pdf$/i, '') + '.annotations.json';
+  /* "paper.pdf" keeps its annotations in "paper.annotations.json". A book
+     keeps its own in "book.epub.annotations.json", so that a PDF and an EPUB
+     of the same name in the same folder cannot share one. */
+  getSidecarPath(file) {
+    if (/\.epub$/i.test(file.path)) return `${file.path}.annotations.json`;
+    return file.path.replace(/\.pdf$/i, '') + '.annotations.json';
   }
 
   async loadDoc(file) {
@@ -601,7 +681,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
      and right-clicking it behave the same. */
   canEdit(doc) {
     if (!doc.readOnly) return true;
-    new Notice('This PDF’s annotations file could not be read, so it cannot be edited.');
+    new Notice('This document’s annotations file could not be read, so its annotations cannot be edited.');
     return false;
   }
 
@@ -1162,6 +1242,13 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
   navigateTo(doc, id) {
     const state = doc && this.viewForDoc(doc);
     if (!state) return false;
+    if (state.kind === 'epub') {
+      if (!state.container.isShown()) this.app.workspace.revealLeaf(state.view.leaf);
+      if (!state.view.goTo(id)) return false;
+      state.flash = { id, since: Date.now(), until: Date.now() + FLASH_MS };
+      state.view.redraw();
+      return true;
+    }
     const target = annotationTarget(doc.data, id);
     const inner = pdfInnerOf(state.view);
     if (!target || !inner || !inner.container) return false;
@@ -1250,6 +1337,10 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
 
   render(state) {
     if (!state.doc || !this.views.has(state.view)) return;
+    if (state.kind === 'epub') {
+      state.view.redraw();
+      return;
+    }
     /* Outside withoutObserver, so that the page rebuild a zoom change causes
        is seen and the overlays are drawn again at the new scale. */
     this.syncZoom(state);
@@ -1377,6 +1468,10 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
   }
 
   refreshToolbarButton(state) {
+    if (state.kind === 'epub') {
+      state.view.refreshModeButton();
+      return;
+    }
     const btn = state.container.querySelector('.mpa-toolbar-btn');
     if (btn) this.styleToolbarButton(btn);
   }
@@ -1436,48 +1531,59 @@ const HELP_FILE = 'settings-help.md';
 /* Stamps of help text written out by earlier versions, so an unedited copy
    can be recognised and brought up to date. Add the current text's stamp
    here whenever DEFAULT_HELP changes. */
-const OLD_HELP_STAMPS = ['41f1859b-3282'];
+const OLD_HELP_STAMPS = ['41f1859b-3282', 'a69ad533-3360'];
 
 const DEFAULT_HELP = `## How it works
 
-Turn on highlight mode from the ribbon, the status bar or the PDF toolbar, then
-select text in a PDF to highlight it.
+Turn on highlight mode from the ribbon, the status bar, or the highlighter
+button in a PDF's toolbar or at the top of a book, then select text in a PDF or
+an EPUB to highlight it.
 
-The annotations sidebar lists every highlight and note on the PDF in front of
-you. It opens by itself the first time you open a PDF, and the command **Open
+The annotations sidebar lists every highlight and note on the document in front
+of you. It opens by itself the first time you open one, and the command **Open
 annotations sidebar** brings it back.
 
-- **Click a card's words** to go to that place in the PDF.
+- **Click a card's words** to go to that place in the document.
 - **Type in "Add note"** under a highlight to annotate it. Notes save as you
   type.
-- **Click a highlight in the PDF** to land in its note box in the sidebar.
-- **Right-click a bare part of a page** for "Add note", which makes a note of
-  its own at that point.
+- **Click a highlight in the document** to land in its note box in the
+  sidebar.
+- **Right-click a bare part of the text** for "Add note", which makes a note
+  of its own at that point.
 - **Delete** a highlight or note from the ··· menu on its card, or by
   selecting the card and pressing Delete.
+- **Hover over a footnote or endnote marker** to read the note where you are.
+  Click the marker, or the preview, to go to it.
 
 A highlight longer than five lines is cut short in the sidebar. Click it once
 to read all of it, and again to go to it.
 
 **Search annotations** at the top of the sidebar filters the cards as you type,
 forgiving a slip or two in each word. Clicking a result shows it among all the
-others; clicking it again goes to it in the PDF. The button beside the search
-box switches between the order things appear in and the order you added them.
+others; clicking it again goes to it in the document. The button beside the
+search box switches between the order things appear in and the order you added
+them.
 
 ## Making a note
 
 The note button at the top of the sidebar creates a note with the same name as
-the PDF, beside it, holding every highlight and note in reading order, and
+the document, beside it, holding every highlight and note in reading order, and
 opens it. If that name is taken, a number is added. The note is yours: the
 plugin never changes it afterwards, so make another when you want an updated
 copy. How it is laid out is set above.
 
+## EPUB
+
+A book opens as one continuous scroll. **A+** and **A−** at the top change the
+text size, which is remembered for each book on this device. Books with DRM,
+and fixed-layout books such as picture books and magazines, can't be opened.
+
 ## Undoing
 
-Cmd or Ctrl with Z steps back through the highlights and notes on the PDF you
-are looking at, and adding Shift steps forward again. The same keys keep their
-usual meaning everywhere else. Inside a note box they undo what you typed,
-grouped by pauses the way the rest of Obsidian groups it.
+Cmd or Ctrl with Z steps back through the highlights and notes on the document
+you are looking at, and adding Shift steps forward again. The same keys keep
+their usual meaning everywhere else. Inside a note box they undo what you
+typed, grouped by pauses the way the rest of Obsidian groups it.
 
 They cannot be rebound. The keys are caught by the plugin rather than
 registered in Obsidian's hotkey settings, because a hotkey bound to this key
@@ -1486,8 +1592,8 @@ commands, **Undo last annotation change** and **Redo last undone annotation
 change**, which you can reach from the command palette or give a second key of
 your own.
 
-The history goes fifty changes back per PDF, lives in memory, and is lost when
-Obsidian restarts. It is also cleared if the annotations file changes from
+The history goes fifty changes back per document, lives in memory, and is lost
+when Obsidian restarts. It is also cleared if the annotations file changes from
 outside the plugin, by a sync for instance, since by then it describes a
 document that no longer exists.
 
@@ -1499,15 +1605,16 @@ carried between machines.
 
 ## Where your annotations live
 
-For \`refs/paper.pdf\`, the annotations are kept in
-\`refs/paper.annotations.json\` beside it. That file is the only copy of them, so
-keep it with the PDF when you move things around.
+For \`refs/paper.pdf\`, the annotations are kept in \`refs/paper.annotations.json\`
+beside it. For \`refs/book.epub\`, they are kept in
+\`refs/book.epub.annotations.json\`. That file is the only copy of them, so keep
+it with its document when you move things around.
 
 ## When a highlight comes out wrong
 
 Run the command **Report what the current selection looks like** with the
-problem text selected. It writes a note describing what the viewer reports for
-every span in the selection, which is what explains the result.
+problem text selected in a PDF. It writes a note describing what the viewer
+reports for every span in the selection, which is what explains the result.
 
 ---
 
@@ -1631,6 +1738,1168 @@ const QUOTE_LINES = 5;
 
 const FIELD_SIZING =
   typeof CSS !== 'undefined' && typeof CSS.supports === 'function' && CSS.supports('field-sizing', 'content');
+
+/* ------------------------------------------------------------------ EPUB
+
+   An EPUB opens in a view of the plugin's own, as one continuous scroll of
+   all its chapters, and is annotated the way a PDF is: the same highlight
+   mode, sidebar, notes, undo and exported note, and the same footnote
+   previews.
+
+   The book is shown in an iframe sandboxed with scripts off, so nothing in a
+   book can run, and everything from the book, footnote previews included,
+   stays inside that frame. The plugin reaches in from outside to draw and to
+   listen. Obsidian's own additions to the DOM (addClass, createDiv and so
+   on) are not installed in the frame's window, so the code that works inside
+   it uses the plain DOM.
+
+   A highlight is anchored by character offsets into the text of its chapter,
+   [chapter, offset], with its words kept as well: if the offsets no longer
+   land on those words, the words are looked for instead. */
+
+class EpubView extends FileView {
+  constructor(leaf, plugin) {
+    super(leaf);
+    this.plugin = plugin;
+    this.frame = null;
+    this.book = null;
+    /** @type {HTMLElement[]} the chapters, in order, inside the frame */
+    this.sections = [];
+    this.layer = null;
+    this.loadToken = 0;
+    this.drawn = new Map();
+    this.ranges = new Map();
+    this.preview = null;
+  }
+
+  getViewType() {
+    return EPUB_VIEW_TYPE;
+  }
+
+  getDisplayText() {
+    return this.file ? this.file.basename : 'EPUB';
+  }
+
+  getIcon() {
+    return 'book-open';
+  }
+
+  canAcceptExtension(extension) {
+    return extension === 'epub';
+  }
+
+  async onOpen() {
+    this.modeButton = this.addAction('highlighter', 'Toggle highlight mode', () => this.plugin.toggleHighlightMode());
+    this.addAction('a-arrow-up', 'Larger text', () => this.stepTextSize(1));
+    this.addAction('a-arrow-down', 'Smaller text', () => this.stepTextSize(-1));
+    this.refreshModeButton();
+  }
+
+  async onLoadFile(file) {
+    const token = ++this.loadToken;
+    this.close();
+    this.contentEl.empty();
+    this.contentEl.addClass('mpa-epub');
+    let book;
+    try {
+      book = await loadEpub(await this.app.vault.readBinary(file));
+    } catch (e) {
+      this.plugin.report(`could not read ${file.path}`, e);
+      if (token === this.loadToken) this.showMessage('This EPUB could not be read. It may be damaged.');
+      return;
+    }
+    if (token !== this.loadToken) {
+      revokeBook(book);
+      return;
+    }
+    if (book.problem) {
+      revokeBook(book);
+      this.showMessage(book.problem);
+      return;
+    }
+    this.book = book;
+    await this.build(book);
+    if (token !== this.loadToken) return;
+    await this.plugin.attachEpub(this);
+  }
+
+  async onUnloadFile() {
+    this.loadToken++;
+    this.plugin.detachEpub(this);
+    this.close();
+  }
+
+  async onClose() {
+    this.loadToken++;
+    this.plugin.detachEpub(this);
+    this.close();
+  }
+
+  close() {
+    this.hidePreview();
+    if (this.resizeObserver) this.resizeObserver.disconnect();
+    this.resizeObserver = null;
+    if (this.book) revokeBook(this.book);
+    this.book = null;
+    this.frame = null;
+    this.sections = [];
+    this.layer = null;
+    this.drawn.clear();
+    this.ranges.clear();
+  }
+
+  showMessage(text) {
+    this.contentEl.empty();
+    this.contentEl.createDiv({ cls: 'mpa-epub-message', text });
+  }
+
+  /* ------------------------------------------------------------ the frame */
+
+  async build(book) {
+    const frame = this.contentEl.createEl('iframe', {
+      cls: 'mpa-epub-frame',
+      attr: { sandbox: 'allow-same-origin', title: book.title || 'EPUB' },
+    });
+    /* Nothing loads from outside the book: pictures, fonts and media only
+       from the blob URLs made for them, styles only from the text put in. */
+    frame.srcdoc =
+      '<!DOCTYPE html><html><head><meta charset="utf-8">' +
+      '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; img-src blob: data:; ' +
+      'font-src blob: data:; media-src blob: data:; style-src \'unsafe-inline\'">' +
+      '</head><body></body></html>';
+    await new Promise((resolve) => frame.addEventListener('load', resolve, { once: true }));
+    this.frame = frame;
+    const d = frame.contentDocument;
+    const head = d.head;
+
+    const base = d.createElement('style');
+    base.id = 'mpa-epub-base';
+    head.appendChild(base);
+    this.applyTheme();
+    for (const text of [...book.styles, ...book.inlineStyles]) {
+      const style = d.createElement('style');
+      style.textContent = text;
+      head.appendChild(style);
+    }
+    /* Last, so a book's own styles cannot hide the highlights. */
+    const own = d.createElement('style');
+    own.textContent = EPUB_FRAME_CSS;
+    head.appendChild(own);
+
+    const body = d.body;
+    this.sections = book.sections.map((section, i) => {
+      const el = d.createElement('section');
+      el.className = 'mpa-section';
+      el.id = `mpa${i}`;
+      el.dataset.section = String(i);
+      if (section.bodyClass) el.className += ` ${section.bodyClass}`;
+      for (const node of Array.from(section.body.childNodes)) el.appendChild(d.importNode(node, true));
+      body.appendChild(el);
+      return el;
+    });
+    this.layer = d.createElement('div');
+    this.layer.className = 'mpa-epub-layer';
+    body.appendChild(this.layer);
+
+    this.applyTextSize();
+    this.listen(d);
+    /* Text reflows when the pane is resized, the text size changes, or an
+       image arrives, and the highlights must follow it. */
+    this.resizeObserver = new ResizeObserver(() => this.scheduleRedraw());
+    this.resizeObserver.observe(body);
+  }
+
+  /* The frame uses Obsidian's colours and fonts as its defaults, which a
+     book's own stylesheet may override. Read again when the theme changes. */
+  applyTheme() {
+    const d = this.frame && this.frame.contentDocument;
+    if (!d) return;
+    const css = getComputedStyle(document.body);
+    const v = (name, fallback) => css.getPropertyValue(name).trim() || fallback;
+    d.getElementById('mpa-epub-base').textContent = EPUB_BASE_CSS.replace(/\{\{([a-z-]+)\|([^}]*)\}\}/g, (_, name, fallback) =>
+      v(`--${name}`, fallback)
+    );
+  }
+
+  /* ---------------------------------------------------------- text size */
+
+  textSize() {
+    const stored = this.file && this.plugin.textSizes[this.file.path];
+    return validTextSize(stored) ? stored : 100;
+  }
+
+  applyTextSize() {
+    const d = this.frame && this.frame.contentDocument;
+    if (d) d.documentElement.style.fontSize = `${this.textSize()}%`;
+  }
+
+  /* Keeps the words at the top of the window in place while the text grows
+     or shrinks around them. */
+  stepTextSize(direction) {
+    if (!this.file || !this.frame) return;
+    const at = this.topPosition();
+    const sizes = TEXT_SIZES;
+    const current = this.textSize();
+    const next =
+      direction > 0 ? sizes.find((s) => s > current) || sizes[sizes.length - 1] : [...sizes].reverse().find((s) => s < current) || sizes[0];
+    this.plugin.noteTextSize(this.file.path, next);
+    this.applyTextSize();
+    if (at) this.scrollToPosition(at, 0);
+  }
+
+  topPosition() {
+    const d = this.frame.contentDocument;
+    const range = caretRangeAt(d, d.body.getBoundingClientRect().left + d.body.clientWidth / 2, 4);
+    return range ? this.positionOf(range.startContainer, range.startOffset) : null;
+  }
+
+  /* -------------------------------------------------- offsets and ranges */
+
+  /* Where a point in the frame's DOM is, as [chapter, offset]. */
+  positionOf(node, offset) {
+    const el = node.nodeType === 1 ? node : node.parentElement;
+    const section = el && el.closest('.mpa-section');
+    if (!section) return null;
+    const range = section.ownerDocument.createRange();
+    range.setStart(section, 0);
+    try {
+      range.setEnd(node, offset);
+    } catch (e) {
+      return null;
+    }
+    return [Number(section.dataset.section), range.toString().length];
+  }
+
+  /* And back again. */
+  pointAt(position) {
+    const section = this.sections[position[0]];
+    if (!section) return null;
+    const walker = section.ownerDocument.createTreeWalker(section, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_CDATA_SECTION);
+    let left = position[1];
+    let node;
+    let last = null;
+    while ((node = walker.nextNode())) {
+      const length = node.nodeValue.length;
+      if (left <= length) return { node, offset: left };
+      left -= length;
+      last = node;
+    }
+    return last ? { node: last, offset: last.nodeValue.length } : { node: section, offset: 0 };
+  }
+
+  sectionText(i) {
+    return this.sections[i] ? this.sections[i].textContent : '';
+  }
+
+  /* The range a highlight covers, checked against its words. */
+  rangeFor(highlight) {
+    const anchor = highlight.epub;
+    if (!anchor || !Array.isArray(anchor.start) || !Array.isArray(anchor.end)) return null;
+    const key = `${highlight.id}:${anchor.start}:${anchor.end}:${highlight.text}`;
+    if (this.ranges.has(key)) return this.ranges.get(key);
+    let range = this.rangeBetween(anchor.start, anchor.end);
+    if (!range || !sameWords(range.toString(), highlight.text)) {
+      /* The offsets have drifted, from a changed book perhaps: the words are
+         looked for in the same chapter, nearest where they were. */
+      const found = findQuote(this.sectionText(anchor.start[0]), highlight.text || '', anchor.start[1]);
+      range = found ? this.rangeBetween([anchor.start[0], found.start], [anchor.start[0], found.end]) : null;
+    }
+    this.ranges.set(key, range);
+    return range;
+  }
+
+  rangeBetween(start, end) {
+    const a = this.pointAt(start);
+    const b = this.pointAt(end);
+    if (!a || !b) return null;
+    const range = this.frame.contentDocument.createRange();
+    try {
+      range.setStart(a.node, a.offset);
+      range.setEnd(b.node, b.offset);
+    } catch (e) {
+      return null;
+    }
+    return range.collapsed ? null : range;
+  }
+
+  /* ------------------------------------------------------------- drawing */
+
+  scheduleRedraw() {
+    if (this.redrawFrame || !this.frame) return;
+    /* Timers and frames go through Obsidian's window: the book's own, with
+       scripts switched off, never runs them. */
+    this.redrawFrame = window.requestAnimationFrame(() => {
+      this.redrawFrame = 0;
+      this.redraw();
+    });
+  }
+
+  redraw() {
+    const state = this.plugin.views.get(this);
+    if (!state || !state.doc || !this.layer) return;
+    const d = this.frame.contentDocument;
+    const origin = d.body.getBoundingClientRect();
+    const settings = this.plugin.settings;
+    const layer = this.layer;
+    while (layer.firstChild) layer.removeChild(layer.firstChild);
+    this.drawn.clear();
+
+    const icon = (id, kind, top, color) => {
+      const el = d.createElement('div');
+      el.className = 'mpa-note-icon';
+      el.dataset.noteId = id;
+      el.dataset.noteKind = kind;
+      el.style.setProperty('--mpa-y', `${top}px`);
+      el.style.setProperty('--mpa-color', color);
+      el.innerHTML = NOTE_ICON_SVG;
+      markFrameFlash(el, state, id);
+      layer.appendChild(el);
+    };
+
+    for (const h of state.doc.data.highlights) {
+      const range = this.rangeFor(h);
+      if (!range) continue;
+      const color = HEX_COLOR_RE.test(h.color || '') ? h.color : settings.highlightColor;
+      const rects = lineRects(range.getClientRects()).map((r) => ({
+        left: r.left - origin.left,
+        top: r.top - origin.top,
+        width: r.width,
+        height: r.height,
+      }));
+      if (!rects.length) continue;
+      this.drawn.set(h.id, rects);
+      for (const r of rects) {
+        const el = d.createElement('div');
+        el.className = 'mpa-highlight';
+        el.dataset.highlightId = h.id;
+        el.style.setProperty('--mpa-x', `${r.left}px`);
+        el.style.setProperty('--mpa-y', `${r.top}px`);
+        el.style.setProperty('--mpa-w', `${r.width}px`);
+        el.style.setProperty('--mpa-h', `${r.height}px`);
+        el.style.setProperty('--mpa-color', color);
+        markFrameFlash(el, state, h.id);
+        layer.appendChild(el);
+      }
+      if (h.note && h.note.trim()) icon(h.id, 'highlight', rects[0].top + rects[0].height / 2, color);
+    }
+
+    for (const n of state.doc.data.notes) {
+      const at = n.epub && Array.isArray(n.epub.at) ? this.pointAt(n.epub.at) : null;
+      if (!at) continue;
+      /* Measured over a character beside the point: a collapsed range at
+         the end of a text node can have no box at all. */
+      const length = at.node.nodeValue ? at.node.nodeValue.length : 0;
+      const from = at.offset < length ? at.offset : Math.max(0, length - 1);
+      const range = d.createRange();
+      range.setStart(at.node, from);
+      range.setEnd(at.node, Math.min(from + 1, length));
+      const r = range.getClientRects()[0] || range.getBoundingClientRect();
+      icon(n.id, 'note', r.top - origin.top + r.height / 2, settings.highlightColor);
+    }
+  }
+
+  refreshModeButton() {
+    if (this.modeButton) {
+      this.modeButton.toggleClass('is-active', this.plugin.highlightMode);
+      this.modeButton.style.setProperty('--mpa-color', this.plugin.settings.highlightColor);
+    }
+    const d = this.frame && this.frame.contentDocument;
+    if (d) d.documentElement.classList.toggle('mpa-mode-active', this.plugin.highlightMode);
+  }
+
+  /* Scrolls an annotation to a third of the way down the window. */
+  goTo(id) {
+    const state = this.plugin.views.get(this);
+    if (!state || !state.doc) return false;
+    const found = findAnnotation(state.doc.data, id);
+    if (!found) return false;
+    let position = null;
+    if (found.kind === 'highlight') {
+      const range = this.rangeFor(found.obj);
+      if (range) {
+        this.scrollToRect(range.getClientRects()[0] || range.getBoundingClientRect());
+        return true;
+      }
+      position = found.obj.epub && found.obj.epub.start;
+    } else {
+      position = found.obj.epub && found.obj.epub.at;
+    }
+    if (!position) return false;
+    this.scrollToPosition(position, 0.3);
+    return true;
+  }
+
+  scrollToPosition(position, fraction) {
+    const at = this.pointAt(position);
+    if (!at) return;
+    const range = this.frame.contentDocument.createRange();
+    range.setStart(at.node, at.offset);
+    range.collapse(true);
+    const rect = range.getClientRects()[0] || (at.node.nodeType === 1 ? at.node.getBoundingClientRect() : at.node.parentElement.getBoundingClientRect());
+    this.scrollToRect(rect, fraction);
+  }
+
+  scrollToRect(rect, fraction = 0.3) {
+    const win = this.frame.contentWindow;
+    win.scrollBy(0, rect.top - win.innerHeight * fraction);
+  }
+
+  /* ------------------------------------------------------------ the mouse */
+
+  listen(d) {
+    const win = d.defaultView;
+    const plugin = this.plugin;
+    const state = () => plugin.views.get(this);
+
+    d.addEventListener('keydown', (e) => {
+      this.hidePreview();
+      plugin.onKeyDown(e);
+      if (e.defaultPrevented || !(e.metaKey || e.ctrlKey || e.altKey || e.key === 'Escape')) return;
+      /* Copying, cutting, pasting and selecting all belong to the book's text. */
+      if ((e.metaKey || e.ctrlKey) && !e.altKey && ['c', 'x', 'v', 'a'].includes((e.key || '').toLowerCase())) return;
+      /* The keyboard moves from the book to its view first. A palette or
+         dialog opened by the key gives the focus back afterwards to wherever
+         it was, and Obsidian cannot give it back to an element inside the
+         book, which lacks its additions to the DOM. */
+      this.contentEl.tabIndex = -1;
+      this.contentEl.focus({ preventScroll: true });
+      /* Keys pressed in the book never reach Obsidian's own window, where its
+         hotkeys listen, so a copy is passed on: Cmd+P and the rest work while
+         reading, and Esc closes an open menu. */
+      const copy = new KeyboardEvent('keydown', {
+        key: e.key,
+        code: e.code,
+        location: e.location,
+        repeat: e.repeat,
+        metaKey: e.metaKey,
+        ctrlKey: e.ctrlKey,
+        altKey: e.altKey,
+        shiftKey: e.shiftKey,
+        bubbles: true,
+        cancelable: true,
+      });
+      document.body.dispatchEvent(copy);
+      if (copy.defaultPrevented) e.preventDefault();
+    }, true);
+    d.addEventListener('mousedown', (e) => {
+      this.pressedAt = { x: e.clientX, y: e.clientY };
+      plugin.recentView = this;
+      /* Clicking into the book makes it the document in front, as clicking
+         into a PDF does: the sidebar follows. */
+      if (this.app.workspace.activeLeaf !== this.leaf) this.app.workspace.setActiveLeaf(this.leaf, { focus: false });
+      plugin.refreshFocus();
+      this.hidePreview(true);
+    });
+    d.addEventListener('mouseup', (e) => {
+      if (e.button !== 0 || !plugin.highlightMode) return;
+      const s = state();
+      if (!s || !s.doc || !plugin.canEdit(s.doc)) return;
+      const id = this.highlightSelection(s.doc);
+      if (id) plugin.showInSidebar(s.doc, id);
+    });
+    d.addEventListener('click', (e) => this.onClick(e, state()));
+    d.addEventListener('contextmenu', (e) => this.onContextMenu(e, state()));
+    d.addEventListener('mouseover', (e) => this.onOver(e));
+    d.addEventListener('mouseout', (e) => this.onOut(e));
+    win.addEventListener('scroll', () => this.hidePreview(), { passive: true });
+  }
+
+  /* The highlight or note marker under a point, if any. */
+  hitAt(x, y) {
+    const d = this.frame.contentDocument;
+    const el = d.elementFromPoint(x, y);
+    const icon = el && el.closest('.mpa-note-icon');
+    if (icon) return { kind: icon.dataset.noteKind, id: icon.dataset.noteId, icon: true };
+    const origin = d.body.getBoundingClientRect();
+    const px = x - origin.left;
+    const py = y - origin.top;
+    for (const [id, rects] of this.drawn) {
+      if (rects.some((r) => px >= r.left && px <= r.left + r.width && py >= r.top && py <= r.top + r.height)) {
+        return { kind: 'highlight', id, icon: false };
+      }
+    }
+    return null;
+  }
+
+  onClick(e, state) {
+    if (e.button !== 0 || !state || !state.doc) return;
+    /* The end of a drag is not a click on whatever it ended over. */
+    const from = this.pressedAt;
+    if (from && Math.hypot(e.clientX - from.x, e.clientY - from.y) > 3) return;
+    /* Every link is handled here, so the frame itself never navigates away
+       from the book. */
+    const link = e.target instanceof this.frame.contentWindow.Element ? e.target.closest('a, area') : null;
+    if (link) {
+      e.preventDefault();
+      this.followLink(link);
+      return;
+    }
+    const selection = this.frame.contentWindow.getSelection();
+    if (selection && !selection.isCollapsed) return;
+    const hit = this.hitAt(e.clientX, e.clientY);
+    if (!hit) return;
+    this.plugin.revealAnnotation(state.doc, hit.id, true).catch((err) => this.plugin.report('could not show the note', err));
+  }
+
+  followLink(link) {
+    const href = link.getAttribute('href') || link.getAttributeNS(XLINK_NS, 'href') || '';
+    if (href.startsWith('#')) {
+      const target = this.linkTarget(link);
+      if (target) this.scrollToRect(target.getBoundingClientRect(), 0.1);
+      return;
+    }
+    if (/^(https?|mailto):/i.test(href)) window.open(href);
+  }
+
+  /* Where a link within the book leads. A book's own ids are kept as they
+     are, so its stylesheets and pictures still find them, which means two
+     chapters may share one; a link is therefore looked up within the chapter
+     it names. Older books mark a place with <a name>, not an id. */
+  linkTarget(link) {
+    const m = /^#mpa(\d+)$/.exec(link.getAttribute('href') || '');
+    const section = m && this.sections[Number(m[1])];
+    if (!section) return null;
+    const fragment = link.getAttribute('data-mpa-fragment');
+    if (!fragment) return section;
+    const esc = CSS.escape(fragment);
+    return section.querySelector(`[id="${esc}"]`) || section.querySelector(`a[name="${esc}"]`) || null;
+  }
+
+  onContextMenu(e, state) {
+    if (!state || !state.doc) return;
+    /* Always ours inside a book: the browser's own menu has nothing to offer
+       there, and on a Mac it holds up the whole window while it is open. */
+    e.preventDefault();
+    const plugin = this.plugin;
+    const doc = state.doc;
+    const menu = new Menu();
+    let items = 0;
+    const add = (build) => {
+      items++;
+      menu.addItem(build);
+    };
+    const selection = this.frame.contentWindow.getSelection();
+    const selected = selection && !selection.isCollapsed ? selection.toString() : '';
+    if (selected) {
+      add((item) =>
+        item
+          .setTitle('Copy')
+          .setIcon('copy')
+          .onClick(() => navigator.clipboard.writeText(selected))
+      );
+    }
+    const hit = this.hitAt(e.clientX, e.clientY);
+    if (!doc.readOnly) {
+      if (hit && hit.kind === 'note') {
+        add((item) => item.setTitle('Edit note').setIcon('sticky-note').onClick(() => plugin.revealAnnotation(doc, hit.id, true)));
+        add((item) => item.setTitle('Remove note').setIcon('trash').onClick(() => plugin.deleteAnnotation(doc, hit.id)));
+      } else if (hit) {
+        const found = findAnnotation(doc.data, hit.id);
+        const hasNote = !!(found && found.obj.note);
+        add((item) =>
+          item
+            .setTitle(hasNote ? 'Edit note' : 'Add note')
+            .setIcon('sticky-note')
+            .onClick(() => plugin.revealAnnotation(doc, hit.id, true))
+        );
+        if (hasNote) {
+          add((item) =>
+            item
+              .setTitle('Remove note')
+              .setIcon('trash')
+              .onClick(() => {
+                const current = findAnnotation(doc.data, hit.id);
+                if (!current) return;
+                current.obj.note = '';
+                plugin.commit(doc, 'removing a note');
+              })
+          );
+        }
+        add((item) => item.setTitle('Remove highlight').setIcon('trash').onClick(() => plugin.deleteAnnotation(doc, hit.id)));
+      } else {
+        const caret = caretRangeAt(this.frame.contentDocument, e.clientX, e.clientY);
+        const position = caret && this.positionOf(caret.startContainer, caret.startOffset);
+        if (position) {
+          add((item) => item.setTitle('Add note').setIcon('sticky-note').onClick(() => this.addNoteAt(doc, position)));
+        }
+      }
+    }
+    if (items) {
+      const frameBox = this.frame.getBoundingClientRect();
+      menu.showAtPosition({ x: frameBox.left + e.clientX, y: frameBox.top + e.clientY });
+    }
+  }
+
+  addNoteAt(doc, position) {
+    if (!this.plugin.canEdit(doc)) return;
+    const note = { id: uuid(), text: '', createdAt: new Date().toISOString(), epub: { at: position } };
+    doc.data.notes.push(note);
+    this.plugin.commit(doc, 'adding a note');
+    this.plugin.revealAnnotation(doc, note.id, true).catch((err) => this.plugin.report('could not show the note', err));
+  }
+
+  /* The selection as a highlight, snapped to whole words unless that is
+     turned off. Returns its id. */
+  highlightSelection(doc) {
+    const win = this.frame.contentWindow;
+    const selection = win.getSelection();
+    if (!selection || selection.isCollapsed || !selection.rangeCount) return null;
+    const range = selection.getRangeAt(0);
+    let start = this.positionOf(range.startContainer, range.startOffset);
+    let end = this.positionOf(range.endContainer, range.endOffset);
+    /* A selection that starts or ends outside the chapters, in a margin say,
+       is cut to the chapters it covers. */
+    if (!start || !end) {
+      const inside = this.sections.filter((s) => range.intersectsNode(s));
+      if (!inside.length) return null;
+      if (!start) start = [Number(inside[0].dataset.section), 0];
+      if (!end) {
+        const lastIndex = Number(inside[inside.length - 1].dataset.section);
+        end = [lastIndex, this.sectionText(lastIndex).length];
+      }
+    }
+    const snap = this.plugin.settings.snapToWords;
+    start = [start[0], snapOffset(this.sectionText(start[0]), start[1], 'start', snap)];
+    end = [end[0], snapOffset(this.sectionText(end[0]), end[1], 'end', snap)];
+    if (compareOrder(start, end) >= 0) return null;
+    const exact = this.rangeBetween(start, end);
+    const text = exact ? collapseWhitespace(exact.toString()) : '';
+    if (!text) return null;
+
+    const highlight = {
+      id: uuid(),
+      text,
+      note: '',
+      color: this.plugin.settings.highlightColor,
+      createdAt: new Date().toISOString(),
+      epub: { start, end },
+    };
+    doc.data.highlights.push(highlight);
+    selection.removeAllRanges();
+    this.plugin.commit(doc, 'adding a highlight');
+    return highlight.id;
+  }
+
+  /* ----------------------------------------------------- footnote preview */
+
+  /* As in a PDF: resting on a link to another place in the book shows what
+     is there, and clicking it goes there. Drawn inside the frame, so a
+     book's markup never leaves the sandbox. */
+  onOver(e) {
+    const win = this.frame.contentWindow;
+    const t = e.target;
+    if (!(t instanceof win.Element)) return;
+    if (this.preview && this.preview.el && this.preview.el.contains(t)) {
+      this.cancelHidePreview();
+      return;
+    }
+    const link = t.closest('a[href^="#mpa"], area[href^="#mpa"]');
+    if (!link || (this.preview && this.preview.link === link)) {
+      if (link) this.cancelHidePreview();
+      return;
+    }
+    this.hidePreview();
+    const token = (this.previewToken = (this.previewToken || 0) + 1);
+    this.preview = { link, el: null, timer: window.setTimeout(() => this.showPreview(link, token), FOOTNOTE_DELAY) };
+  }
+
+  onOut(e) {
+    if (!this.preview) return;
+    const win = this.frame.contentWindow;
+    const inside = (node) =>
+      node instanceof win.Node && (this.preview.link.contains(node) || (!!this.preview.el && this.preview.el.contains(node)));
+    if (!inside(e.target) || inside(e.relatedTarget)) return;
+    this.cancelHidePreview();
+    this.preview.hideTimer = window.setTimeout(() => this.hidePreview(), FOOTNOTE_GRACE);
+  }
+
+  cancelHidePreview() {
+    if (this.preview && this.preview.hideTimer) {
+      window.clearTimeout(this.preview.hideTimer);
+      this.preview.hideTimer = null;
+    }
+  }
+
+  hidePreview(keepIfInside) {
+    const p = this.preview;
+    if (!p) return;
+    if (keepIfInside === true && p.el && p.el.matches(':hover')) return;
+    window.clearTimeout(p.timer);
+    window.clearTimeout(p.hideTimer);
+    if (p.el) p.el.remove();
+    this.preview = null;
+    this.previewToken = (this.previewToken || 0) + 1;
+  }
+
+  showPreview(link, token) {
+    if (token !== this.previewToken || !this.preview) return;
+    const d = this.frame.contentDocument;
+    const target = this.linkTarget(link);
+    if (!target) return;
+    const el = d.createElement('div');
+    el.className = 'mpa-epub-footnote';
+    const inner = d.createElement('div');
+    inner.className = 'mpa-epub-footnote-text';
+    el.appendChild(inner);
+    for (const block of previewBlocks(target)) inner.appendChild(block.cloneNode(true));
+    /* Ids in the copy would be found by the next link instead of the real
+       place, and links in it would lead nowhere useful. */
+    for (const node of inner.querySelectorAll('[id]')) node.removeAttribute('id');
+    el.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.hidePreview();
+      this.scrollToRect(target.getBoundingClientRect(), 0.1);
+    });
+    d.body.appendChild(el);
+    /* Faded at the foot only when there is more than fits. */
+    if (inner.scrollHeight > inner.clientHeight + 1) inner.classList.add('is-long');
+    const win = d.defaultView;
+    const r = link.getBoundingClientRect();
+    const at = placeBox(
+      { left: r.left, top: r.top, bottom: r.bottom },
+      { width: el.offsetWidth, height: el.offsetHeight },
+      { width: win.innerWidth, height: win.innerHeight }
+    );
+    el.style.left = `${at.left}px`;
+    el.style.top = `${at.top}px`;
+    this.preview.el = el;
+  }
+}
+
+/* What a footnote preview shows for the place a link leads to: the element
+   itself if it is a block, such as a list item or an aside, or the block it
+   sits in; for a whole chapter or more, its first few blocks. */
+function previewBlocks(target) {
+  const BLOCKS = 'p, li, aside, dd, dt, blockquote, td, figure, div, section';
+  let el = target;
+  if (!el.matches(BLOCKS) || el.matches('.mpa-section')) {
+    const block = el.closest(BLOCKS);
+    if (block && !block.matches('.mpa-section')) el = block;
+  }
+  const big = el.matches('.mpa-section, section, body') || el.children.length > 6;
+  if (!big) return [el];
+  return Array.from(el.children).slice(0, 3);
+}
+
+function caretRangeAt(d, x, y) {
+  if (d.caretRangeFromPoint) return d.caretRangeFromPoint(x, y);
+  const pos = d.caretPositionFromPoint && d.caretPositionFromPoint(x, y);
+  if (!pos) return null;
+  const range = d.createRange();
+  range.setStart(pos.offsetNode, pos.offset);
+  return range;
+}
+
+/* The rectangles of a range, one per line: the browser reports one per text
+   node, so a line with italics in it comes back in pieces. */
+function lineRects(rectList) {
+  const lines = [];
+  for (const r of Array.from(rectList)) {
+    if (r.width < 0.5 || r.height < 0.5) continue;
+    const line = lines.find((l) => Math.abs(l.top - r.top) < r.height / 2 && Math.abs(l.bottom - r.bottom) < r.height / 2);
+    if (line) {
+      line.left = Math.min(line.left, r.left);
+      line.right = Math.max(line.right, r.right);
+      line.top = Math.min(line.top, r.top);
+      line.bottom = Math.max(line.bottom, r.bottom);
+    } else {
+      lines.push({ left: r.left, right: r.right, top: r.top, bottom: r.bottom });
+    }
+  }
+  return lines.map((l) => ({ left: l.left, top: l.top, width: l.right - l.left, height: l.bottom - l.top }));
+}
+
+function markFrameFlash(el, state, id) {
+  const elapsed = flashElapsed(state, id);
+  if (elapsed === null) return;
+  el.style.setProperty('--mpa-flash-delay', `-${elapsed}ms`);
+  el.classList.add('mpa-flash');
+}
+
+/* Moves an offset in a chapter's text to the edge of the word it falls in,
+   and off any spaces, so a highlight starts and ends on words. With
+   snapping off, only the spaces are trimmed. */
+function snapOffset(text, offset, side, snap) {
+  let i = Math.max(0, Math.min(offset, text.length));
+  const word = (ch) => !!ch && WORD_CHAR_RE.test(ch);
+  if (side === 'start') {
+    while (i < text.length && /\s/.test(text[i])) i++;
+    if (snap) while (i > 0 && word(text[i - 1]) && word(text[i])) i--;
+  } else {
+    while (i > 0 && /\s/.test(text[i - 1])) i--;
+    if (snap) while (i < text.length && word(text[i - 1]) && word(text[i])) i++;
+  }
+  return i;
+}
+
+function sameWords(a, b) {
+  return collapseWhitespace(a || '') === collapseWhitespace(b || '');
+}
+
+/* Finds a highlight's words in its chapter's text, whatever the spacing,
+   taking the occurrence nearest where it used to be. */
+function findQuote(text, quote, near) {
+  const words = collapseWhitespace(quote);
+  if (!words) return null;
+  const pattern = new RegExp(words.split(' ').map(escapeRegExp).join('\\s+'), 'g');
+  let best = null;
+  let m;
+  while ((m = pattern.exec(text))) {
+    const candidate = { start: m.index, end: m.index + m[0].length };
+    if (!best || Math.abs(candidate.start - near) < Math.abs(best.start - near)) best = candidate;
+    if (m[0].length === 0) pattern.lastIndex++;
+  }
+  return best;
+}
+
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function validTextSize(value) {
+  return typeof value === 'number' && TEXT_SIZES.includes(value);
+}
+
+/* ------------------------------------------------------- reading the file */
+
+/* The files inside a zip, from its central directory. Only what an EPUB
+   uses: stored or deflated entries, no encryption, no zip64. */
+function readZip(buffer) {
+  const bytes = new Uint8Array(buffer);
+  const view = new DataView(buffer);
+  let end = -1;
+  for (let i = bytes.length - 22; i >= Math.max(0, bytes.length - 22 - 65535); i--) {
+    if (view.getUint32(i, true) === 0x06054b50) {
+      end = i;
+      break;
+    }
+  }
+  if (end < 0) throw new Error('not a zip file');
+  const count = view.getUint16(end + 10, true);
+  let at = view.getUint32(end + 16, true);
+  const decoder = new TextDecoder();
+  const entries = new Map();
+  for (let n = 0; n < count; n++) {
+    if (view.getUint32(at, true) !== 0x02014b50) throw new Error('damaged zip directory');
+    const flags = view.getUint16(at + 8, true);
+    const method = view.getUint16(at + 10, true);
+    const packed = view.getUint32(at + 20, true);
+    const size = view.getUint32(at + 24, true);
+    const nameLength = view.getUint16(at + 28, true);
+    const extraLength = view.getUint16(at + 30, true);
+    const commentLength = view.getUint16(at + 32, true);
+    const local = view.getUint32(at + 42, true);
+    const name = decoder.decode(bytes.subarray(at + 46, at + 46 + nameLength));
+    entries.set(name, { name, flags, method, packed, size, local });
+    at += 46 + nameLength + extraLength + commentLength;
+  }
+
+  async function read(name) {
+    const entry = entries.get(name);
+    if (!entry) return null;
+    if (entry.flags & 1) throw new Error(`${name} is encrypted`);
+    const l = entry.local;
+    if (view.getUint32(l, true) !== 0x04034b50) throw new Error(`damaged zip entry ${name}`);
+    const start = l + 30 + view.getUint16(l + 26, true) + view.getUint16(l + 28, true);
+    const data = bytes.subarray(start, start + entry.packed);
+    if (entry.method === 0) return data.slice();
+    if (entry.method !== 8) throw new Error(`${name} uses an unsupported compression`);
+    const stream = new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  }
+
+  return {
+    names: () => Array.from(entries.keys()),
+    has: (name) => entries.has(name),
+    read,
+    async text(name) {
+      const data = await read(name);
+      return data === null ? null : new TextDecoder().decode(data);
+    },
+  };
+}
+
+const XLINK_NS = 'http://www.w3.org/1999/xlink';
+
+/* Percent-decoding that leaves a stray "%" alone rather than throwing. */
+function safeDecode(text) {
+  try {
+    return decodeURIComponent(text);
+  } catch (e) {
+    return text;
+  }
+}
+
+/* A path inside the book, from a link written relative to another file. */
+function resolveBookPath(from, href) {
+  const clean = safeDecode(String(href).split('#')[0].split('?')[0]);
+  if (!clean) return from;
+  const parts = clean.startsWith('/') ? [] : from.split('/').slice(0, -1);
+  for (const part of clean.split('/')) {
+    if (part === '..') parts.pop();
+    else if (part && part !== '.') parts.push(part);
+  }
+  return parts.join('/');
+}
+
+/* Font obfuscation is not DRM: it is how a book carries its fonts legally,
+   and the text is untouched. Anything else that is encrypted is. */
+const FONT_OBFUSCATION = ['http://www.idpf.org/2008/embedding', 'http://ns.adobe.com/pdf/enc#RC'];
+
+function drmProtected(encrypted) {
+  return encrypted.some((entry) => !FONT_OBFUSCATION.includes(entry.algorithm));
+}
+
+const MEDIA_EXTENSIONS = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  gif: 'image/gif',
+  svg: 'image/svg+xml',
+  webp: 'image/webp',
+  css: 'text/css',
+  ttf: 'font/ttf',
+  otf: 'font/otf',
+  woff: 'font/woff',
+  woff2: 'font/woff2',
+};
+
+async function loadEpub(buffer) {
+  const blobs = [];
+  try {
+    return await readBook(buffer, blobs);
+  } catch (e) {
+    for (const url of blobs) URL.revokeObjectURL(url);
+    throw e;
+  }
+}
+
+async function readBook(buffer, blobs) {
+  const zip = readZip(buffer);
+  const parse = (text, type) => new DOMParser().parseFromString(text, type);
+  const broken = (d) => !d || d.getElementsByTagName('parsererror').length > 0;
+
+  if (zip.has('META-INF/rights.xml')) {
+    return { problem: 'This book is protected by DRM, so it can’t be opened here.', blobs: [] };
+  }
+  const encryption = await zip.text('META-INF/encryption.xml');
+  if (encryption) {
+    const d = parse(encryption, 'application/xml');
+    const encrypted = Array.from(d.getElementsByTagNameNS('*', 'EncryptedData')).map((el) => {
+      const method = el.getElementsByTagNameNS('*', 'EncryptionMethod')[0];
+      return { algorithm: method ? method.getAttribute('Algorithm') : '' };
+    });
+    if (drmProtected(encrypted)) {
+      return { problem: 'This book is protected by DRM, so it can’t be opened here.', blobs: [] };
+    }
+  }
+
+  const container = parse((await zip.text('META-INF/container.xml')) || '', 'application/xml');
+  const rootfile = !broken(container) && container.getElementsByTagNameNS('*', 'rootfile')[0];
+  const opfPath = rootfile && rootfile.getAttribute('full-path');
+  const opfText = opfPath && (await zip.text(opfPath));
+  if (!opfText) throw new Error('no package document');
+  const opf = parse(opfText, 'application/xml');
+  if (broken(opf)) throw new Error('the package document could not be read');
+
+  const metas = Array.from(opf.getElementsByTagNameNS('*', 'meta'));
+  const layout = metas.find((m) => m.getAttribute('property') === 'rendition:layout');
+  if (layout && layout.textContent.trim() === 'pre-paginated') {
+    return {
+      problem: 'This is a fixed-layout book, made of pages like a picture book or a magazine. Only books whose text flows can be opened here.',
+      blobs: [],
+    };
+  }
+  const titleEl = opf.getElementsByTagNameNS('*', 'title')[0];
+
+  const manifest = new Map();
+  for (const item of Array.from(opf.getElementsByTagNameNS('*', 'item'))) {
+    manifest.set(item.getAttribute('id'), {
+      path: resolveBookPath(opfPath, item.getAttribute('href') || ''),
+      type: item.getAttribute('media-type') || '',
+    });
+  }
+  const spine = Array.from(opf.getElementsByTagNameNS('*', 'itemref'))
+    .map((ref) => manifest.get(ref.getAttribute('idref')))
+    .filter((item) => item && /html/.test(item.type));
+  if (!spine.length) throw new Error('the book has no chapters');
+
+  /* Every image and font as a blob URL the frame can load. */
+  const urls = new Map();
+  const typeOf = (p) => MEDIA_EXTENSIONS[(p.split('.').pop() || '').toLowerCase()] || '';
+  const others = zip.names().filter((p) => typeOf(p) && typeOf(p) !== 'text/css');
+  for (const p of others) {
+    const data = await zip.read(p);
+    const url = URL.createObjectURL(new Blob([data], { type: typeOf(p) }));
+    blobs.push(url);
+    urls.set(p, url);
+  }
+  const rewriteCss = (css, from) =>
+    css
+      .replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g, (whole, q, href) => {
+        if (/^(data|https?|blob):/i.test(href)) return whole;
+        const url = urls.get(resolveBookPath(from, href));
+        return url ? `url("${url}")` : whole;
+      })
+      .replace(/@import\s+[^;]+;/g, '');
+  /* Stylesheets go in as text: one loaded from a blob URL under Obsidian's
+     app:// scheme is treated as foreign, and its rules are never applied. */
+  const sheets = new Map();
+  for (const p of zip.names().filter((n) => typeOf(n) === 'text/css')) {
+    sheets.set(p, rewriteCss((await zip.text(p)) || '', p));
+  }
+
+  const sectionOf = new Map(spine.map((item, i) => [item.path, i]));
+  const styles = [];
+  const inlineStyles = [];
+  const sections = [];
+  for (const [i, item] of spine.entries()) {
+    const text = (await zip.text(item.path)) || '';
+    let d = parse(text, 'application/xhtml+xml');
+    if (broken(d)) d = parse(text, 'text/html');
+    for (const link of Array.from(d.querySelectorAll('link[rel~="stylesheet"][href]'))) {
+      const css = sheets.get(resolveBookPath(item.path, link.getAttribute('href')));
+      if (css !== undefined && !styles.includes(css)) styles.push(css);
+    }
+    for (const style of Array.from(d.querySelectorAll('style'))) {
+      const css = rewriteCss(style.textContent || '', item.path);
+      if (!inlineStyles.includes(css)) inlineStyles.push(css);
+    }
+    const body = d.body || d.getElementsByTagName('body')[0] || d.documentElement;
+    prepareChapter(body, i, item.path, urls, sectionOf);
+    sections.push({ body, bodyClass: body.getAttribute && body.getAttribute('class') });
+  }
+
+  return { title: titleEl ? titleEl.textContent.trim() : '', sections, styles, inlineStyles, blobs };
+}
+
+/* Readies a chapter for the frame: no scripts, no styles of its own (they
+   have been collected already), links within the book pointed at the
+   chapter they lead to, and pictures pointed at their blob URLs. */
+function prepareChapter(body, index, path, urls, sectionOf) {
+  for (const el of Array.from(body.querySelectorAll('script, noscript, iframe, object, embed, base, meta, link, style'))) el.remove();
+  const XLINK = XLINK_NS;
+  for (const el of Array.from(body.querySelectorAll('*'))) {
+    for (const attr of Array.from(el.attributes)) {
+      if (/^on/i.test(attr.name)) el.removeAttribute(attr.name);
+    }
+    const tag = el.localName;
+    if ((tag === 'a' || tag === 'area') && (el.hasAttribute('href') || el.hasAttributeNS(XLINK, 'href'))) {
+      const href = el.getAttribute('href') || el.getAttributeNS(XLINK, 'href');
+      el.removeAttributeNS(XLINK, 'href');
+      if (/^[a-z][a-z0-9+.-]*:/i.test(href)) {
+        el.setAttribute('href', href);
+        continue;
+      }
+      const at = href.indexOf('#');
+      const file = at < 0 ? href : href.slice(0, at);
+      const fragment = at < 0 ? '' : safeDecode(href.slice(at + 1));
+      const section = sectionOf.get(file ? resolveBookPath(path, file) : path);
+      if (section === undefined) {
+        el.removeAttribute('href');
+        continue;
+      }
+      el.setAttribute('href', `#mpa${section}`);
+      if (fragment) el.setAttribute('data-mpa-fragment', fragment);
+      continue;
+    }
+    for (const name of ['src', 'href', 'poster']) {
+      const value = name === 'href' && !el.hasAttribute('href') ? el.getAttributeNS(XLINK, 'href') : el.getAttribute(name);
+      if (!value || /^(data|https?|blob):/i.test(value)) continue;
+      const url = urls.get(resolveBookPath(path, value));
+      if (!url) continue;
+      if (name === 'href' && !el.hasAttribute('href')) el.setAttributeNS(XLINK, 'xlink:href', url);
+      else el.setAttribute(name, url);
+    }
+  }
+}
+
+function revokeBook(book) {
+  for (const url of (book && book.blobs) || []) URL.revokeObjectURL(url);
+}
+
+const NOTE_ICON_SVG =
+  '<svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V8Z"/><path d="M15 3v4a2 2 0 0 0 2 2h4"/></svg>';
+
+/* The frame's defaults, filled in from Obsidian's theme: {{name|fallback}}
+   is the value of --name. A book's own stylesheet comes after, and wins. */
+const EPUB_BASE_CSS = `
+html { background: {{background-primary|#fff}}; }
+body {
+  box-sizing: border-box;
+  position: relative;
+  max-width: 44em;
+  margin: 0 auto;
+  padding: 2.5em 3.5em 50vh;
+  color: {{text-normal|#222}};
+  font-family: {{font-text|serif}};
+  line-height: 1.6;
+  overflow-wrap: break-word;
+}
+img, svg, video { max-width: 100%; height: auto; }
+a { color: {{text-accent|#2878c8}}; }
+::selection { background: {{text-selection|rgba(40,120,200,0.25)}}; }
+.mpa-section + .mpa-section { margin-top: 3em; }
+.mpa-epub-footnote {
+  background: {{background-primary|#fff}};
+  color: {{text-normal|#222}};
+  border: 1px solid {{background-modifier-border|#ddd}};
+}
+`;
+
+/* Ours, after the book's. */
+const EPUB_FRAME_CSS = `
+.mpa-epub-layer { position: absolute; inset: 0; pointer-events: none; z-index: 3; }
+.mpa-highlight {
+  position: absolute;
+  left: var(--mpa-x); top: var(--mpa-y); width: var(--mpa-w); height: var(--mpa-h);
+  background-color: var(--mpa-color, #ffeb3b);
+  opacity: 0.4;
+  mix-blend-mode: multiply;
+  pointer-events: none;
+}
+.mpa-note-icon {
+  position: absolute;
+  left: 1em;
+  top: var(--mpa-y);
+  transform: translateY(-50%);
+  width: 14px; height: 14px;
+  pointer-events: auto;
+  cursor: pointer;
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.25));
+}
+.mpa-note-icon svg { width: 14px; height: 14px; fill: var(--mpa-color, #ffeb3b); stroke: #333; stroke-width: 1.4; }
+html.mpa-mode-active body { cursor: text; }
+html.mpa-mode-active .mpa-section { cursor: crosshair; }
+@keyframes mpa-flash {
+  0%, 50%, 100% { box-shadow: 0 0 0 0 transparent; }
+  25%, 75% { box-shadow: 0 0 0 3px var(--mpa-color, #2878c8); }
+}
+.mpa-highlight.mpa-flash, .mpa-note-icon.mpa-flash {
+  animation: mpa-flash 1.2s ease-in-out;
+  animation-delay: var(--mpa-flash-delay, 0s);
+  animation-fill-mode: both;
+}
+.mpa-epub-footnote {
+  position: fixed;
+  z-index: 10;
+  box-sizing: border-box;
+  max-width: min(30em, calc(100vw - 16px));
+  padding: 0.6em 0.9em;
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+  font-size: 0.9em;
+  cursor: pointer;
+}
+.mpa-epub-footnote-text { max-height: 12em; overflow: hidden; }
+.mpa-epub-footnote-text.is-long {
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 1.5em), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 1.5em), transparent);
+}
+.mpa-epub-footnote-text :first-child { margin-top: 0; padding-top: 0; }
+.mpa-epub-footnote-text :last-child { margin-bottom: 0; padding-bottom: 0; }
+`;
 
 /* Hovering a link to another place in the same PDF, which is what a footnote
    or endnote marker is, shows a picture of the place it leads to, as Zotero
@@ -1950,7 +3219,7 @@ class AnnotationsView extends ItemView {
     this.emptyEl.toggle(empty);
     this.emptyEl.setText(
       !this.doc
-        ? 'Open a PDF to see its annotations here.'
+        ? 'Open a PDF or an EPUB to see its annotations here.'
         : !this.cards.size
           ? 'No annotations yet. Turn on highlight mode and select some text.'
           : 'No annotations match.'
@@ -2836,21 +4105,23 @@ function annotationItems(data, sort) {
   const items = [];
   for (const h of (data && data.highlights) || []) {
     const first = firstRect(h);
+    const start = h.epub && Array.isArray(h.epub.start) ? h.epub.start : null;
     items.push({
       id: h.id,
       kind: 'highlight',
       obj: h,
-      order: first ? [first.page, first.y, first.x] : [0, 0, 0],
+      order: start ? [start[0], start[1], 0] : first ? [first.page, first.y, first.x] : [0, 0, 0],
       createdAt: h.createdAt || '',
     });
   }
   for (const n of (data && data.notes) || []) {
     const p = n.position || {};
+    const at = n.epub && Array.isArray(n.epub.at) ? n.epub.at : null;
     items.push({
       id: n.id,
       kind: 'note',
       obj: n,
-      order: [n.page || 0, p.y || 0, p.x || 0],
+      order: at ? [at[0], at[1], 0] : [n.page || 0, p.y || 0, p.x || 0],
       createdAt: n.createdAt || '',
     });
   }
