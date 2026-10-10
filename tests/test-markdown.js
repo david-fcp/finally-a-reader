@@ -50,6 +50,7 @@ const stubs = {
     PluginSettingTab: class {},
     Setting: class {},
     Menu: MenuStub,
+    ItemView: class {},
     Notice: class { constructor(message) { notices.push(message); } },
     TFile,
     Platform: { isMacOS: true },
@@ -69,7 +70,8 @@ m._compile(
     "firstRect,migrateHighlight,dropRunningHeads,unionRect,pagePaddingBox," +
     "measurable,cell,round,blank,charAt,describePoint,sameLine,boundaryPosition," +
     "indexOfBoundary,touchedBounds,refineBoundary,nearestPointer,isWordChar,insideWord," +
-    "snapStart,snapEnd,selectedSlice,linesFromChars,textOfChars,snapshot,NoteHistory,BoxDrag," +
+    "snapStart,snapEnd,selectedSlice,linesFromChars,textOfChars,snapshot,NoteHistory," +
+    "annotationItems,compareOrder,findAnnotation,annotationTarget,flashing,flashElapsed,pdfInnerOf,AnnotationsView," +
     "validZoom,pdfViewerOf,pruneZooms,placeBox,clampToViewport};\n",
   P
 );
@@ -807,13 +809,14 @@ console.log("\n--- undo and redo");
 function undoHarness() {
   const plugin = Object.create(PluginClass.prototype);
   plugin.views = new Map();
-  plugin.noteBox = null;
+  plugin.noteFields = new WeakMap();
+  plugin.app = { workspace: { getLeavesOfType: () => [] } };
   plugin.saved = 0;
   plugin.queueSave = () => {
     plugin.saved++;
   };
-  plugin.closeNoteBox = () => {
-    plugin.closedBoxes = (plugin.closedBoxes || 0) + 1;
+  plugin.notify = () => {
+    plugin.notified = (plugin.notified || 0) + 1;
   };
   /* Drawing needs a real page in a real viewer; counted, not performed. */
   plugin.render = () => {
@@ -917,7 +920,7 @@ console.log("  what it does not disturb");
   plugin.undo(doc);
   eq("undoing leaves the ownership marker alone", doc.data.markdownStamp, "written-since");
   eq("and saves the result", plugin.saved > 0, true);
-  eq("and closes any open note box", plugin.closedBoxes > 0, true);
+  eq("and the sidebar is told", plugin.notified > 0, true);
   plugin.views.set("v", { view: "v", container: {}, doc });
   plugin.renders = 0;
   plugin.redo(doc);
@@ -1135,32 +1138,36 @@ console.log("  the undo keys");
   plugin.onKeyDown(e);
   eq("so is the same key with alt held", e.claimed, 0);
 
-  /* An open note box takes the key for its own text, through its own history,
-     and the annotation around it is left alone. */
+  /* A sidebar note box being typed in takes the key for its own text,
+     through its own history, and tells the annotation what it now says. */
   {
-    const textarea = { closest: (sel) => (sel.includes(".mpa-note-box") ? {} : null), value: "typed", selectionEnd: 5, setSelectionRange() {} };
-    plugin.noteHistory = new T.NoteHistory(textarea);
-    plugin.noteHistory.record(10000);
+    const textarea = { closest: (sel) => (sel.includes("textarea") ? {} : null), value: "typed", selectionEnd: 5, setSelectionRange() {} };
+    const history = new T.NoteHistory(textarea);
+    history.record(10000);
     textarea.value = "typed more";
-    plugin.noteHistory.record(20000);
+    history.record(20000);
+    let synced = 0;
+    plugin.noteFields.set(textarea, { history, sync: () => synced++ });
 
     const before = titles(doc).join();
     const ev = press(textarea);
     plugin.onKeyDown(ev);
     eq("the note box claims the key", ev.claimed > 0, true);
     eq("and undoes its own words", textarea.value, "typed");
-    eq("leaving the annotations alone", titles(doc).join(), before);
+    eq("and passes them on to the annotation", synced, 1);
+    eq("leaving the other annotations alone", titles(doc).join(), before);
 
     const ev2 = press(textarea, { shiftKey: true });
     plugin.onKeyDown(ev2);
     eq("and redoes them", textarea.value, "typed more");
-    plugin.noteHistory = null;
+    eq("passing that on too", synced, 2);
+    plugin.noteFields.delete(textarea);
   }
 
   /* The cases that must be left alone, each standing for something with an
      undo of its own. */
   for (const [what, selector] of [
-    ["a note box with no history of its own", ".mpa-note-box"],
+    ["a text box with no history of its own", "textarea"],
     ["a text editor", ".cm-editor"],
     ["a form field", "input"],
   ]) {
@@ -1394,8 +1401,10 @@ function menuFor(hit) {
   const plugin = Object.create(PluginClass.prototype);
   plugin.locate = () => hit;
   plugin.calls = [];
-  plugin.openHighlightNote = (state, id) => plugin.calls.push(["highlight note", id]);
-  plugin.openStandaloneNote = (state, id) => plugin.calls.push(["standalone note", id]);
+  plugin.revealAnnotation = (doc, id, focusNote) => {
+    plugin.calls.push(["sidebar", id, focusNote]);
+    return Promise.resolve();
+  };
   plugin.addStandaloneNote = () => plugin.calls.push(["new standalone note"]);
   plugin.commit = () => {};
   const event = { clientX: 10, clientY: 20, preventDefault() {} };
@@ -1418,7 +1427,7 @@ const page = {};
   });
   eq("on a highlight with no note, the offer is to add one", menu.items[0].title, "Add note");
   menu.items[0].click();
-  eq("and it goes to that highlight", plugin.calls, [["highlight note", "h1"]]);
+  eq("and it goes to that highlight", plugin.calls, [["sidebar", "h1", true]]);
   eq("removing the highlight is offered too", menu.items.some((i) => i.title === "Remove highlight"), true);
   eq("but there is no note to remove yet", menu.items.some((i) => i.title === "Remove note"), false);
 }
@@ -1434,7 +1443,7 @@ const page = {};
   });
   eq("on a highlight that has one, the offer is to edit it", menu.items[0].title, "Edit note");
   menu.items[0].click();
-  eq("still going to that highlight", plugin.calls, [["highlight note", "h1"]]);
+  eq("still going to that highlight", plugin.calls, [["sidebar", "h1", true]]);
   eq("and now it can be removed", menu.items.some((i) => i.title === "Remove note"), true);
 }
 
@@ -1451,7 +1460,7 @@ const page = {};
   });
   eq("the marker leads back to its highlight", menu.items[0].title, "Edit note");
   menu.items[0].click();
-  eq("and to its note", plugin.calls, [["highlight note", "h1"]]);
+  eq("and to its note", plugin.calls, [["sidebar", "h1", true]]);
 }
 
 {
@@ -1467,7 +1476,7 @@ const page = {};
   });
   eq("a standalone marker offers to edit that note", menu.items[0].title, "Edit note");
   menu.items[0].click();
-  eq("the standalone one", plugin.calls, [["standalone note", "n1"]]);
+  eq("the standalone one", plugin.calls, [["sidebar", "n1", true]]);
   eq("and to remove it", menu.items.some((i) => i.title === "Remove note"), true);
   eq("with no highlight to remove", menu.items.some((i) => i.title === "Remove highlight"), false);
 }
@@ -1631,101 +1640,7 @@ console.log("  restoring and then following");
 }
 
 
-console.log("\n--- where a note box opens");
-
-/* Both ways of asking for a note on a highlight go through one function and
-   resolve the anchor themselves, when the box opens. Carrying the element from
-   the click that asked for it was the bug: a context-menu item runs after the
-   menu closes, a redraw may have replaced that element in the meantime, and a
-   detached element measures as nothing, which put the box in the top-left
-   corner of the window. */
-console.log("  anchorFor");
-{
-  const laidOut = (left, top, width) => ({
-    getBoundingClientRect: () => ({ left, top, bottom: top + 12, width, height: 12 }),
-  });
-  /* What a replaced element looks like: still referenced, no longer in the
-     page, so every measurement is zero. */
-  const detached = () => ({
-    getBoundingClientRect: () => ({ left: 0, top: 0, bottom: 0, width: 0, height: 0 }),
-  });
-
-  function plugin(elements, pointers, containerRect) {
-    const p = Object.create(PluginClass.prototype);
-    p.pointers = pointers || {};
-    p.stateFor = {
-      container: {
-        querySelectorAll: () => elements,
-        getBoundingClientRect: () => containerRect || { left: 500, top: 300 },
-      },
-    };
-    return p;
-  }
-
-  {
-    const p = plugin([laidOut(120, 400, 80)]);
-    eq("the element's own box is used", p.anchorFor(p.stateFor, ".x").left, 120);
-  }
-  {
-    const p = plugin([detached(), laidOut(120, 400, 80)]);
-    const at = p.anchorFor(p.stateFor, ".x");
-    eq("a replaced element is skipped", at.left, 120);
-    eq("rather than measuring as the top-left corner", at.left === 0 && at.top === 0, false);
-    eq("and does not drag the anchor up to the top of the window", at.top, 400);
-  }
-  {
-    const p = plugin([detached()], { up: { x: 70, y: 90 } });
-    const at = p.anchorFor(p.stateFor, ".x");
-    eq("with nothing on screen, the pointer is used", [at.left, at.bottom], [70, 90]);
-  }
-  {
-    const p = plugin([], {}, { left: 500, top: 300 });
-    const at = p.anchorFor(p.stateFor, ".x");
-    eq("and failing that, the top of the view", [at.left, at.top], [520, 320]);
-  }
-}
-
-/* The two ways of asking for a note on a highlight must behave identically
-   once the decision is made, including refusing in the same circumstances. */
-console.log("  both ways of asking refuse together");
-{
-  function opener(readOnly) {
-    const p = Object.create(PluginClass.prototype);
-    const highlight = hl("quoted", [r(1, 0.5)], { note: "" });
-    highlight.id = "h1";
-    const doc = { data: { highlights: [highlight], notes: [] }, readOnly };
-    p.opened = 0;
-    p.pointers = {};
-    p.openNoteBox = () => {
-      p.opened++;
-    };
-    const state = {
-      doc,
-      container: {
-        querySelectorAll: () => [
-          { getBoundingClientRect: () => ({ left: 10, top: 20, bottom: 32, width: 50, height: 12 }) },
-        ],
-        getBoundingClientRect: () => ({ left: 0, top: 0 }),
-      },
-    };
-    return { p, state };
-  }
-
-  const ok = opener(false);
-  ok.p.openHighlightNote(ok.state, "h1");
-  eq("an editable PDF opens the box", ok.p.opened, 1);
-
-  const refused = opener(true);
-  notices.length = 0;
-  refused.p.openHighlightNote(refused.state, "h1");
-  eq("one whose annotations could not be read does not", refused.p.opened, 0);
-  eq("and says why", notices.length, 1);
-
-  const gone = opener(false);
-  gone.p.openHighlightNote(gone.state, "no-such-highlight");
-  eq("a highlight that is gone opens nothing", gone.p.opened, 0);
-}
-
+console.log("\n--- placeBox");
 console.log("  placeBox");
 {
   const size = { width: 240, height: 90 };
@@ -1764,46 +1679,6 @@ console.log("  placeBox");
 }
 
 
-console.log("\n--- the box clears what it belongs to");
-{
-  /* A highlight running over three lines. The box has to go below the last of
-     them, not below the first, or it covers the words being annotated. */
-  const line = (top) => ({
-    getBoundingClientRect: () => ({ left: 120, top, bottom: top + 13, width: 400, height: 13 }),
-  });
-  const p = Object.create(PluginClass.prototype);
-  p.pointers = {};
-  const state = {
-    container: {
-      querySelectorAll: () => [line(400), line(413), line(426)],
-      getBoundingClientRect: () => ({ left: 0, top: 0 }),
-    },
-  };
-  const anchor = p.anchorFor(state, ".x");
-  eq("the anchor covers every line of it", [anchor.top, anchor.bottom], [400, 439]);
-  eq("and starts at the leftmost", anchor.left, 120);
-
-  const placed = T.placeBox(anchor, { width: 240, height: 90 }, { width: 1200, height: 800 });
-  eq("so the box sits below the last line", placed.top, 439 + 6);
-  eq("aligned with the start of the text", placed.left, 120);
-}
-{
-  /* Lines at differing indents, as a paragraph's first and last often are. */
-  const at = (left, top, width) => ({
-    getBoundingClientRect: () => ({ left, top, bottom: top + 13, width, height: 13 }),
-  });
-  const p = Object.create(PluginClass.prototype);
-  p.pointers = {};
-  const state = {
-    container: {
-      querySelectorAll: () => [at(300, 400, 220), at(120, 413, 400), at(120, 426, 90)],
-      getBoundingClientRect: () => ({ left: 0, top: 0 }),
-    },
-  };
-  const anchor = p.anchorFor(state, ".x");
-  eq("the anchor reaches the leftmost line", anchor.left, 120);
-  eq("and the lowest", anchor.bottom, 439);
-}
 
 console.log("\n--- clampToViewport");
 {
@@ -1823,65 +1698,192 @@ console.log("\n--- clampToViewport");
 }
 
 
-console.log("\n--- dragging a note box");
 
-/* A drag that did not end when the button was released, because the box stops
-   mouse events from travelling further and so swallowed the release before the
-   document heard it. The listeners now go on in the capture phase, and two
-   rules here make the drag end even if a release is missed entirely. */
-{
-  const moves = [];
-  const drag = new T.BoxDrag((left, top) => moves.push([left, top]));
+  console.log("\n--- the sidebar's list");
+  {
+    const data = {
+      highlights: [
+        hl("later", [r(2, 0.1)], { createdAt: "2026-10-10T10:00:00Z" }),
+        hl("first", [r(1, 0.5)], { createdAt: "2026-10-10T12:00:00Z" }),
+      ],
+      notes: [{ id: "n1", page: 1, text: "thought", position: { x: 0.5, y: 0.2 }, createdAt: "2026-10-10T11:00:00Z" }],
+    };
+    eq("in reading order: page, then down the page", T.annotationItems(data, "position").map((i) => i.id), ["n1", "first", "later"]);
+    eq("or in the order they were made, oldest first", T.annotationItems(data, "date").map((i) => i.id), ["later", "n1", "first"]);
+    eq("each knows its kind", T.annotationItems(data, "position").map((i) => i.kind), ["note", "highlight", "highlight"]);
+    eq("an unknown order falls back to reading order", T.annotationItems(data, "nonsense").map((i) => i.id), ["n1", "first", "later"]);
+    eq("an empty document lists nothing", T.annotationItems({}, "position"), []);
+    eq("and so does no document", T.annotationItems(null, "position"), []);
 
-  eq("nothing is dragging to begin with", drag.active, false);
-  eq("a move before any drag does nothing", drag.move(50, 50, 1), false);
-  eq("and moves nothing", moves.length, 0);
+    const tied = {
+      highlights: [hl("lower", [r(1, 0.9)], { createdAt: "same" }), hl("upper", [r(1, 0.1)], { createdAt: "same" })],
+      notes: [],
+    };
+    eq("made at the same moment, reading order decides", T.annotationItems(tied, "date").map((i) => i.id), ["upper", "lower"]);
 
-  drag.start(100, 200, 300, 400);
-  eq("a drag is live once started", drag.active, true);
+    const sameLine = { highlights: [hl("right", [r(1, 0.5, 0.6)]), hl("left", [r(1, 0.5, 0.1)])], notes: [] };
+    eq("on the same line, left before right", T.annotationItems(sameLine, "position").map((i) => i.id), ["left", "right"]);
+  }
 
-  eq("a move while held keeps it live", drag.move(110, 210, 1), true);
-  eq("and shifts the box by the same amount", moves[0], [310, 410]);
+  console.log("\n--- compareOrder");
+  eq("earlier first", T.compareOrder([1, 2], [1, 3]) < 0, true);
+  eq("later after", T.compareOrder([2, 0], [1, 9]) > 0, true);
+  eq("equal is equal", T.compareOrder([1, 2, 3], [1, 2, 3]), 0);
+  eq("a missing part counts as nothing", T.compareOrder([1, 2], [1, 2, 0]), 0);
 
-  drag.move(90, 180, 1);
-  eq("moving back the other way too", moves[1], [290, 380]);
-  eq("always measured from where the drag began", moves.length, 2);
+  console.log("\n--- findAnnotation and annotationTarget");
+  {
+    const data = {
+      highlights: [hl("quoted", [r(3, 0.7), r(3, 0.4)])],
+      notes: [{ id: "n1", page: 5, text: "x", position: { x: 0.2, y: 0.3 } }],
+    };
+    eq("a highlight is found", T.findAnnotation(data, "quoted").kind, "highlight");
+    eq("so is a note", T.findAnnotation(data, "n1").kind, "note");
+    eq("something that is not there is not", T.findAnnotation(data, "gone"), null);
+    eq("a highlight is gone to at its first line", T.annotationTarget(data, "quoted"), { page: 3, y: 0.4 });
+    eq("a note at the point it was put", T.annotationTarget(data, "n1"), { page: 5, y: 0.3 });
+    eq("nothing to go to for something missing", T.annotationTarget(data, "gone"), null);
+    eq("nor for a highlight with no rectangles", T.annotationTarget({ highlights: [hl("bare", [])], notes: [] }, "bare"), null);
+  }
 
-  eq("releasing ends it", drag.stop(), true);
-  eq("so it is no longer live", drag.active, false);
-  eq("stopping again reports there was nothing to stop", drag.stop(), false);
+  console.log("\n--- flashing");
+  {
+    const later = Date.now() + 10000;
+    eq("the annotation being pointed out", T.flashing({ flash: { id: "a", until: later } }, "a"), true);
+    eq("not another one", T.flashing({ flash: { id: "a", until: later } }, "b"), false);
+    eq("not once the moment has passed", T.flashing({ flash: { id: "a", until: Date.now() - 1 } }, "a"), false);
+    eq("nothing when nothing is", T.flashing({}, "a"), false);
+  }
 
-  eq("a move afterwards does nothing", drag.move(500, 500, 1), false);
-  eq("and moves nothing", moves.length, 2);
-}
+  console.log("\n--- editing from the sidebar");
+  {
+    /* A note typed in the sidebar reaches the annotation as it is typed, is
+       saved shortly after, and becomes one undo step when the box is left. */
+    const { plugin, doc } = undoHarness();
+    plugin.saveSoon = () => {
+      plugin.savesQueued = (plugin.savesQueued || 0) + 1;
+    };
+    plugin.scheduleRedraw = () => {};
+    doc.data.highlights.push(hl("quoted", [r(1, 0.5)]));
+    plugin.commit(doc, "adding a highlight");
+    const depth = doc.undoStack.length;
 
-{
-  /* A button let go outside the window is never reported, so the next move
-     with nothing held has to end the drag by itself. */
-  const moves = [];
-  const drag = new T.BoxDrag((left, top) => moves.push([left, top]));
-  drag.start(100, 200, 300, 400);
-  drag.move(110, 210, 1);
-  eq("one move while held", moves.length, 1);
+    plugin.setNote(doc, "quoted", "a");
+    plugin.setNote(doc, "quoted", "a thought");
+    eq("typing reaches the annotation at once", doc.data.highlights[0].note, "a thought");
+    eq("and is saved", plugin.savesQueued, 2);
+    eq("but is not yet an undo step", doc.undoStack.length, depth);
+    plugin.endNoteEdit(doc);
+    eq("leaving the box files one step for the whole edit", doc.undoStack.length, depth + 1);
+    eq("labelled as such", doc.undoStack[doc.undoStack.length - 1].label, "editing a note");
+    plugin.undo(doc);
+    eq("which undoes all the typing at once", doc.data.highlights[0].note, "");
+    plugin.redo(doc);
+    eq("and redoes it at once", doc.data.highlights[0].note, "a thought");
+  }
+  {
+    const { plugin, doc } = undoHarness();
+    plugin.saveSoon = () => {};
+    plugin.scheduleRedraw = () => {};
+    doc.data.highlights.push(hl("quoted", [r(1, 0.5)]));
+    plugin.commit(doc, "adding a highlight");
+    const depth = doc.undoStack.length;
+    plugin.setNote(doc, "quoted", "x");
+    plugin.setNote(doc, "quoted", "");
+    plugin.endNoteEdit(doc);
+    eq("typed and rubbed out again, there is nothing to undo", doc.undoStack.length, depth);
+    plugin.endNoteEdit(doc);
+    eq("and leaving twice does not file anything either", doc.undoStack.length, depth);
+  }
+  {
+    const { plugin, doc } = undoHarness();
+    plugin.saveSoon = () => {};
+    plugin.scheduleRedraw = () => {};
+    doc.data.notes.push({ id: "n1", page: 1, text: "", position: { x: 0.5, y: 0.5 } });
+    plugin.setNote(doc, "n1", "a note of its own");
+    eq("a note of its own takes its words in its text", doc.data.notes[0].text, "a note of its own");
+    plugin.setNote(doc, "missing", "nothing");
+    eq("a note for something that is gone changes nothing", doc.data.notes.length, 1);
+    doc.readOnly = true;
+    plugin.setNote(doc, "n1", "changed");
+    eq("a read-only document is not written to", doc.data.notes[0].text, "a note of its own");
+  }
 
-  eq("a move with no button held ends the drag", drag.move(120, 220, 0), false);
-  eq("without moving the box again", moves.length, 1);
-  eq("and it is no longer live", drag.active, false);
-  eq("so later moves are ignored even with a button held", drag.move(130, 230, 1), false);
-  eq("still one move", moves.length, 1);
-}
+  console.log("\n--- deleting from the sidebar");
+  {
+    const { plugin, doc } = undoHarness();
+    doc.data.highlights.push(hl("quoted", [r(1, 0.5)], { note: "kept with it" }));
+    doc.data.notes.push({ id: "n1", page: 1, text: "mine", position: { x: 0.5, y: 0.5 } });
+    plugin.commit(doc, "adding");
+    plugin.deleteAnnotation(doc, "quoted");
+    eq("a highlight is deleted with its note", doc.data.highlights.length, 0);
+    eq("as one undo step", doc.undoStack[doc.undoStack.length - 1].label, "removing a highlight");
+    plugin.deleteAnnotation(doc, "n1");
+    eq("so is a note of its own", doc.data.notes.length, 0);
+    plugin.undo(doc);
+    plugin.undo(doc);
+    eq("and both come back", [doc.data.highlights.length, doc.data.notes.length], [1, 1]);
+    eq("note and all", doc.data.highlights[0].note, "kept with it");
+    const depth = doc.undoStack.length;
+    plugin.deleteAnnotation(doc, "gone");
+    eq("deleting something that is not there does nothing", doc.undoStack.length, depth);
+    notices.length = 0;
+    doc.readOnly = true;
+    plugin.deleteAnnotation(doc, "quoted");
+    eq("a read-only document refuses", doc.data.highlights.length, 1);
+    eq("and says why", notices.length, 1);
+  }
 
-{
-  /* A second drag starts from wherever the box was left. */
-  const moves = [];
-  const drag = new T.BoxDrag((left, top) => moves.push([left, top]));
-  drag.start(0, 0, 100, 100);
-  drag.move(10, 10, 1);
-  drag.stop();
-  drag.start(50, 50, 110, 110);
-  drag.move(60, 60, 1);
-  eq("the second drag continues from the new position", moves[1], [120, 120]);
-}
+  console.log("\n--- found in review");
+  {
+    /* A note being typed when the sidebar switches to another document is
+       filed against the document it was typed in, not the one switched to. */
+    const view = Object.create(T.AnnotationsView.prototype);
+    const filed = [];
+    view.plugin = { endNoteEdit: (doc) => filed.push(doc.name) };
+    view.listEl = { empty() {} };
+    view.cards = new Map();
+    view.refresh = () => {};
+    const a = { name: "A", editing: true };
+    const b = { name: "B", editing: false };
+    view.doc = a;
+    view.setDoc(b);
+    eq("the edit is filed against the document left", filed, ["A"]);
+    eq("and the sidebar moves on", view.doc, b);
+    filed.length = 0;
+    view.setDoc(b);
+    eq("refreshing the same document files nothing", filed, []);
+    view.doc = { name: "C", editing: false };
+    view.setDoc(a);
+    eq("nothing is filed when nothing was being typed", filed, []);
+  }
+  {
+    /* Two requests for the sidebar arriving together make one sidebar. */
+    const leaves = [];
+    const workspace = {
+      getLeavesOfType: () => leaves.slice(),
+      getRightLeaf: () => {
+        const leaf = { view: null, async setViewState() { await new Promise((r) => setTimeout(r, 20)); this.view = Object.create(T.AnnotationsView.prototype); } };
+        leaves.push(leaf);
+        return leaf;
+      },
+      revealLeaf: async () => {},
+    };
+    const plugin = Object.create(PluginClass.prototype);
+    plugin.app = { workspace };
+    const [one, two] = await Promise.all([plugin.ensureSidebar(true), plugin.ensureSidebar(false)]);
+    eq("only one sidebar is made", leaves.length, 1);
+    eq("and both requests get it", one === two && !!one, true);
+  }
+  {
+    /* A redrawn highlight carries on its flash from where it was. */
+    const start = Date.now() - 400;
+    const state = { flash: { id: "a", since: start, until: start + 1200 } };
+    const elapsed = T.flashElapsed(state, "a");
+    eq("partway through, it knows how far", elapsed >= 400 && elapsed < 1000, true);
+    eq("another annotation is not flashing", T.flashElapsed(state, "b"), null);
+    eq("nor is anything once it is over", T.flashElapsed({ flash: { id: "a", since: 0, until: 1 } }, "a"), null);
+  }
 
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);

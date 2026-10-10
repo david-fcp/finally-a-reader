@@ -67,6 +67,13 @@ margin, outside the horizontal span of the body lines, or text drawn at a
 near-zero height (two of the three stamp words are about a pixel tall). The
 harness reports this as a known issue rather than a failure.
 
+Whether the boxes are drawn depends on the zoom. Two of the three stamp words
+are about a pixel tall, and below half a pixel they are treated as having no
+position. That leaves "777309" on its own, which the filter then drops, so at
+small zooms the boxes disappear while the stamp's text is still swept into the
+highlight. The harness pins the zoom for this check so the result does not
+depend on how wide the sidebar leaves the page.
+
 `dropRunningHeads()` catches the common case: a line standing far above or
 below everything else selected on that page is dropped. It is deliberately
 timid, because dropping real text would be worse than leaving a page number

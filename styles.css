@@ -71,55 +71,156 @@ body.mpa-mode-active .textLayer {
   stroke-width: 1.4;
 }
 
-/* --------------------------------------------------------------- note box */
+/* ------------------------------------------------------- being pointed out */
 
-.mpa-note-box {
-  position: fixed;
-  left: var(--mpa-note-x, 0);
-  top: var(--mpa-note-y, 0);
-  z-index: var(--layer-popover, 30);
-  min-width: 240px;
-  padding: 6px;
-  background: var(--background-primary);
+/* An annotation just navigated to, from its card in the sidebar, or a card
+   just navigated to, from the document. Two soft pulses, then gone. */
+@keyframes mpa-flash {
+  0%, 50%, 100% { box-shadow: 0 0 0 0 transparent; }
+  25%, 75% { box-shadow: 0 0 0 3px var(--mpa-color, var(--interactive-accent)); }
+}
+
+/* A negative delay, set from script, lets an element redrawn halfway through
+   carry on from where the last one was instead of starting again. */
+.mpa-highlight.mpa-flash,
+.mpa-note-icon.mpa-flash,
+.mpa-card.mpa-flash {
+  animation: mpa-flash 1.2s ease-in-out;
+  animation-delay: var(--mpa-flash-delay, 0s);
+  animation-fill-mode: both;
+}
+
+/* ----------------------------------------------------------------- sidebar */
+
+.mpa-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-4-2);
+  padding: var(--size-4-2);
+}
+
+.mpa-sidebar-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-4-2);
+}
+
+.mpa-sidebar-empty {
+  padding: var(--size-4-4) var(--size-4-2);
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  text-align: center;
+}
+
+/* One annotation. */
+.mpa-card {
+  position: relative;
+  padding: var(--size-4-2) var(--size-4-2) var(--size-4-1) var(--size-4-3);
   border: 1px solid var(--background-modifier-border);
-  border-radius: var(--radius-m);
-  box-shadow: var(--shadow-s);
-}
-
-/* The strip the box is dragged by. Dragging the text area itself would fight
-   with selecting text in it. */
-.mpa-note-handle {
-  height: 14px;
-  margin: -2px -2px 2px;
   border-radius: var(--radius-s);
-  cursor: move;
+  background: var(--background-primary);
 }
 
-.mpa-note-handle::after {
-  content: '';
-  display: block;
-  width: 28px;
-  height: 3px;
-  margin: 5px auto 0;
-  border-radius: 2px;
-  background: var(--background-modifier-border);
-}
-
-.mpa-note-handle:hover::after {
-  background: var(--background-modifier-border-hover);
-}
-
-.mpa-note-box textarea {
-  width: 100%;
-  min-height: 60px;
-  padding: 0;
-  border: none;
+.mpa-card:focus {
   outline: none;
+}
+
+.mpa-card.is-selected,
+.mpa-card:focus-visible {
+  border-color: var(--interactive-accent);
+}
+
+.mpa-card-head {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--size-4-1);
+}
+
+/* The highlighted words, with the highlight's own colour as a bar beside
+   them, as Zotero shows them. The note underneath runs the full width, so the
+   words and the note never look alike. */
+.mpa-card-quote {
+  flex: 1;
+  min-width: 0;
+  padding-left: var(--size-4-2);
+  border-left: 3px solid var(--mpa-color, #ffeb3b);
+  font-size: var(--font-ui-small);
+  line-height: var(--line-height-normal);
+  color: var(--text-normal);
+  cursor: pointer;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.mpa-card-quote:hover {
+  color: var(--text-accent);
+}
+
+/* A note of its own has no words; its header is a strip to click instead. */
+.mpa-card-label {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  min-height: 20px;
+  color: var(--mpa-color, #ffeb3b);
+  cursor: pointer;
+}
+
+.mpa-card-label svg {
+  width: 16px;
+  height: 16px;
+  fill: var(--mpa-color, #ffeb3b);
+  stroke: var(--text-normal);
+}
+
+.mpa-card-more {
+  flex: none;
+  padding: 2px;
+  opacity: 0;
+}
+
+.mpa-card:hover .mpa-card-more,
+.mpa-card.is-selected .mpa-card-more,
+.mpa-card-more:focus-visible {
+  opacity: 1;
+}
+
+/* Starts as one line, grows as the note does. Browsers that cannot grow a
+   text box by themselves get a height measured by script instead. */
+/* Shifted left by its own padding and border, so the note's text starts at
+   the card's edge, level with the colour bar above it. */
+.mpa-card-note {
+  display: block;
+  width: calc(100% + 7px);
+  margin-left: -7px;
+  min-height: calc(var(--font-ui-small) * var(--line-height-normal) + 8px);
+  height: var(--mpa-note-height, auto);
+  margin-top: var(--size-4-1);
+  padding: 4px 6px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-s);
   background: transparent;
   color: var(--text-normal);
-  resize: vertical;
   font-family: var(--font-interface);
   font-size: var(--font-ui-small);
+  line-height: var(--line-height-normal);
+  resize: none;
+  overflow: hidden;
+  field-sizing: content;
+}
+
+.mpa-card-note:hover {
+  background: var(--background-modifier-hover);
+}
+
+.mpa-card-note:focus {
+  border-color: var(--background-modifier-border-focus);
+  background: var(--background-primary);
+  box-shadow: none;
+}
+
+.mpa-card-note::placeholder {
+  color: var(--text-faint);
 }
 
 /* ---------------------------------------------------------------- toggles */

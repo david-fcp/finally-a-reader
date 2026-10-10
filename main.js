@@ -3,17 +3,14 @@
 /*
  * Minimal PDF annotator.
  *
- * Select text in a PDF with highlight mode on and it is highlighted. Click a
- * highlight to attach a note; right-click a page for a standalone note.
+ * Select text in a PDF with highlight mode on and it is highlighted. The
+ * annotations sidebar lists every highlight and note on the document in front
+ * of you, after Zotero's: click a card's words to go to them, type in its
+ * "Add note" box to annotate them, and click a highlight in the document to
+ * land in its box. Right-click a bare part of a page for a note of its own.
  *
- * Two files sit next to each PDF:
- *   <name>.annotations.json  the annotations themselves, and the only source
- *                            of truth. Safe to sync, diff and back up.
- *   <name>.md                a generated transcript of them, so highlights are
- *                            searchable and linkable as ordinary markdown.
- *
- * The markdown file is rewritten from the JSON, so the plugin will not touch
- * one it does not recognise as its own: see writeMarkdown().
+ * The annotations are kept in <name>.annotations.json beside the PDF, the one
+ * source of truth for both the document and the sidebar.
  */
 
 const {
@@ -28,12 +25,15 @@ const {
   debounce,
   setIcon,
   normalizePath,
+  ItemView,
 } = require('obsidian');
 
 const DEFAULT_SETTINGS = {
   highlightColor: '#ffeb3b',
   snapToWords: true,
   rememberZoom: true,
+  /* 'position' or 'date'. */
+  sidebarSort: 'position',
 };
 
 const HEX_COLOR_RE = /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
@@ -55,6 +55,9 @@ const ZOOM_WORDS = ['auto', 'page-actual', 'page-fit', 'page-width', 'page-heigh
 /* Obsidian's built-in PDF viewer registers this view type. */
 const PDF_VIEW_TYPE = 'pdf';
 
+/* The plugin's own annotations sidebar. */
+const SIDEBAR_VIEW_TYPE = 'mpa-annotations';
+
 class MinimalPdfAnnotatorPlugin extends Plugin {
   async onload() {
     await this.loadSettings();
@@ -70,9 +73,12 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     this.views = new Map();
 
     this.highlightMode = false;
-    this.noteBox = null;
-    this.noteHistory = null;
     this.recentView = null;
+    /* The PDF view used most recently, whose document the sidebar shows. */
+    this.focusView = null;
+    /* Each sidebar note box being typed in, with its own undo history. */
+    this.noteFields = new WeakMap();
+    this.sidebarOffered = false;
     this.zooms = this.readZooms();
     /* A pinch or a run of zoom steps changes the value many times over; the
        store only needs the one it settles on. */
@@ -83,6 +89,8 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     this.pointers = { down: null, up: null };
 
     this.applyModeColor();
+
+    this.registerView(SIDEBAR_VIEW_TYPE, (leaf) => new AnnotationsView(leaf, this));
 
     this.ribbonEl = this.addRibbonIcon('highlighter', 'Toggle PDF highlight mode', () =>
       this.toggleHighlightMode()
@@ -100,6 +108,14 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
       id: 'toggle-highlight-mode',
       name: 'Toggle highlight mode',
       callback: () => this.toggleHighlightMode(),
+    });
+
+    this.addCommand({
+      id: 'open-annotations',
+      name: 'Open annotations sidebar',
+      callback: () => {
+        this.ensureSidebar(true).catch((e) => this.report('could not open the sidebar', e));
+      },
     });
 
     /* Cmd or Ctrl with Z already works inside a PDF, from onKeyDown. These
@@ -147,7 +163,10 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     );
 
     this.registerEvent(this.app.workspace.on('layout-change', () => this.scheduleSync()));
-    this.registerEvent(this.app.workspace.on('active-leaf-change', () => this.scheduleSync()));
+    this.registerEvent(this.app.workspace.on('active-leaf-change', () => {
+      this.scheduleSync();
+      this.refreshFocus();
+    }));
     this.registerEvent(this.app.workspace.on('file-open', () => this.scheduleSync()));
     this.app.workspace.onLayoutReady(() => this.scheduleSync());
 
@@ -165,7 +184,13 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
 
   onunload() {
     for (const state of this.views.values()) this.syncZoom(state);
-    this.closeNoteBox();
+    /* Typing still waiting to be saved is saved now rather than dropped. */
+    for (const doc of this.docs.values()) {
+      if (!doc.saveTimer) continue;
+      window.clearTimeout(doc.saveTimer);
+      doc.saveTimer = null;
+      this.queueSave(doc);
+    }
     document.body.removeClass('mpa-mode-active');
     document.body.style.removeProperty('--mpa-mode-color');
     for (const view of Array.from(this.views.keys())) this.teardownView(view);
@@ -298,6 +323,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     for (const view of Array.from(this.views.keys())) {
       if (!live.has(view)) this.teardownView(view);
     }
+    this.refreshFocus();
   }
 
   async setupView(view) {
@@ -332,6 +358,8 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     for (const other of this.views.values()) {
       if (other.doc === state.doc) this.render(other);
     }
+    this.refreshFocus();
+    this.maybeOpenSidebar();
   }
 
   teardownView(view) {
@@ -341,6 +369,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
        nothing redrew afterwards. */
     this.syncZoom(state);
     this.views.delete(view);
+    if (this.focusView === view) this.focusView = null;
     if (state.observer) state.observer.disconnect();
     if (state.frame) window.cancelAnimationFrame(state.frame);
     state.container
@@ -407,6 +436,9 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
       baseline: snapshot(loaded.data),
       undoStack: [],
       redoStack: [],
+      /* A note being typed in the sidebar, not yet filed as an undo step. */
+      editing: false,
+      saveTimer: null,
     };
     this.docs.set(file.path, doc);
     return doc;
@@ -587,16 +619,18 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     const target = e.target;
     if (target instanceof Element) {
       /* A note box undoes the words in it, not the annotation around it, and
-         does so through its own history rather than the browser's. */
-      if (this.noteHistory && target === this.noteHistory.el) {
+         does so through its own history rather than the browser's, which
+         steps one character at a time. */
+      const field = this.noteFields.get(target);
+      if (field) {
         e.preventDefault();
         e.stopPropagation();
-        if (undo) this.noteHistory.undo();
-        else this.noteHistory.redo();
+        const changed = undo ? field.history.undo() : field.history.redo();
+        if (changed) field.sync();
         return;
       }
       /* Anything else with an undo of its own keeps the key untouched. */
-      if (target.closest('.mpa-note-box, input, textarea, .cm-editor, [contenteditable="true"]')) {
+      if (target.closest('input, textarea, .cm-editor, [contenteditable="true"]')) {
         return;
       }
     }
@@ -623,7 +657,8 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     this.pointers.up = { x: e.clientX, y: e.clientY };
     const hit = this.locate(e);
     if (!hit || !this.canEdit(hit.state.doc)) return;
-    this.addHighlightsFromSelection(hit.state);
+    const id = this.addHighlightsFromSelection(hit.state);
+    if (id) this.showInSidebar(hit.state.doc, id);
   }
 
   onClick(e) {
@@ -631,18 +666,16 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     const hit = this.locate(e);
     if (!hit) return;
 
-    if (hit.noteIconEl) {
-      e.stopPropagation();
-      const id = hit.noteIconEl.dataset.noteId;
-      if (hit.noteIconEl.dataset.noteKind === 'note') this.openStandaloneNote(hit.state, id);
-      else this.openHighlightNote(hit.state, id);
-      return;
-    }
-    if (hit.highlightEl) {
-      this.openHighlightNote(hit.state, hit.highlightEl.dataset.highlightId);
-      return;
-    }
-    this.closeNoteBox();
+    /* A highlight, or a note's marker, puts the cursor in its note box in the
+       sidebar. Clicking the page anywhere else does nothing of ours. */
+    const id = hit.noteIconEl
+      ? hit.noteIconEl.dataset.noteId
+      : hit.highlightEl
+      ? hit.highlightEl.dataset.highlightId
+      : null;
+    if (!id) return;
+    if (hit.noteIconEl) e.stopPropagation();
+    this.revealAnnotation(hit.state.doc, id, true).catch((err) => this.report('could not show the note', err));
   }
 
   onContextMenu(e) {
@@ -670,7 +703,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
         item
           .setTitle('Edit note')
           .setIcon('sticky-note')
-          .onClick(() => this.openStandaloneNote(state, iconId))
+          .onClick(() => this.revealAnnotation(state.doc, iconId, true))
       );
     } else if (highlightId) {
       const existing = state.doc.data.highlights.find((h) => h.id === highlightId);
@@ -678,7 +711,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
         item
           .setTitle(existing && existing.note ? 'Edit note' : 'Add note')
           .setIcon('sticky-note')
-          .onClick(() => this.openHighlightNote(state, highlightId))
+          .onClick(() => this.revealAnnotation(state.doc, highlightId, true))
       );
     } else {
       menu.addItem((item) =>
@@ -739,10 +772,15 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     doc.redoStack.length = 0;
     doc.baseline = snapshot(doc.data);
 
+    if (doc.saveTimer) {
+      window.clearTimeout(doc.saveTimer);
+      doc.saveTimer = null;
+    }
     this.queueSave(doc);
     for (const state of this.views.values()) {
       if (state.doc === doc) this.render(state);
     }
+    this.notify(doc);
   }
 
   /* ------------------------------------------------------------ undo / redo */
@@ -754,6 +792,10 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     for (const state of this.views.values()) {
       if (focused && state.container.contains(focused)) return state.doc;
     }
+    /* Focus in the sidebar, outside a note box: its document. */
+    for (const sidebar of this.sidebars()) {
+      if (focused && sidebar.doc && sidebar.containerEl.contains(focused)) return sidebar.doc;
+    }
     const recent = this.views.get(this.recentView);
     if (recent && recent.container.isShown && recent.container.isShown()) return recent.doc;
     return null;
@@ -764,9 +806,6 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     const entry = from.pop();
     to.push({ state: snapshot(doc.data), label: entry.label });
 
-    /* A note box open over the annotation being restored would be left
-       showing text that no longer exists. */
-    this.closeNoteBox();
     doc.data.highlights = entry.state.highlights;
     doc.data.notes = entry.state.notes;
     doc.baseline = snapshot(doc.data);
@@ -775,6 +814,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     for (const state of this.views.values()) {
       if (state.doc === doc) this.render(state);
     }
+    this.notify(doc);
     return true;
   }
 
@@ -807,10 +847,10 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
       doc.baseline = snapshot(doc.data);
       doc.undoStack.length = 0;
       doc.redoStack.length = 0;
-      this.closeNoteBox();
       for (const state of this.views.values()) {
         if (state.doc === doc) this.render(state);
       }
+      this.notify(doc);
       return;
     }
   }
@@ -873,8 +913,9 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     selection.removeAllRanges();
     /* One highlight, however many pages it runs across, so that removing it
        removes the whole thing. */
+    const id = uuid();
     state.doc.data.highlights.push({
-      id: uuid(),
+      id,
       text,
       rects,
       /* Recorded per highlight, so changing the setting later recolours
@@ -884,6 +925,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
       createdAt: new Date().toISOString(),
     });
     this.commit(state.doc, 'adding a highlight');
+    return id;
   }
 
   /* ------------------------------------------------------------ diagnostics */
@@ -1004,204 +1046,189 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     await this.app.workspace.openLinkText(path, '', true);
   }
 
-  /* --------------------------------------------------------- note popovers */
+  /* ------------------------------------------------------- the sidebar side */
 
-  /* One note box exists at a time, anchored to whatever was clicked. `commit`
-     is handed the textarea's text; returning nothing means no change. */
-  openNoteBox(anchor, initial, onCommit) {
-    this.closeNoteBox();
+  sidebars() {
+    return this.app.workspace
+      .getLeavesOfType(SIDEBAR_VIEW_TYPE)
+      .map((leaf) => leaf.view)
+      .filter((view) => view instanceof AnnotationsView);
+  }
 
-    const box = document.body.createDiv({ cls: 'mpa-note-box' });
-    const handle = box.createDiv({ cls: 'mpa-note-handle' });
-    handle.setAttribute('aria-label', 'Drag to move');
-    const textarea = box.createEl('textarea', {
-      attr: { placeholder: `${Platform.isMacOS ? 'Cmd' : 'Ctrl'}+Enter to save, Esc to close` },
-    });
-    textarea.value = initial;
+  /* The document the sidebar shows: the one in the PDF view used most
+     recently, for as long as that view stays open. Moving into the sidebar, or
+     into a markdown note, leaves it where it was. */
+  focusDoc() {
+    const state = this.views.get(this.focusView);
+    if (state && state.doc) return state.doc;
+    for (const other of this.views.values()) if (other.doc) return other.doc;
+    return null;
+  }
 
-    /* Its own undo, so the keys group typing the way they do everywhere else
-       in Obsidian rather than stepping one character at a time. */
-    const history = new NoteHistory(textarea);
-    this.noteHistory = history;
-    textarea.addEventListener('input', () => history.record(Date.now()));
+  refreshFocus() {
+    const recent = this.app.workspace.getMostRecentLeaf && this.app.workspace.getMostRecentLeaf();
+    if (recent && recent.view && this.views.has(recent.view)) this.focusView = recent.view;
+    if (this.focusView && !this.views.has(this.focusView)) this.focusView = null;
+    const doc = this.focusDoc();
+    for (const sidebar of this.sidebars()) sidebar.setDoc(doc);
+  }
 
-    /* Measured now that the box is in the page, so it can be kept on screen. */
-    const size = () => ({ width: box.offsetWidth, height: box.offsetHeight });
-    const viewport = () => ({ width: window.innerWidth, height: window.innerHeight });
-    let at = placeBox(anchor, size(), viewport());
-    const moveTo = (left, top) => {
-      at = clampToViewport(left, top, size(), viewport());
-      box.style.setProperty('--mpa-note-x', at.left + 'px');
-      box.style.setProperty('--mpa-note-y', at.top + 'px');
-    };
-    moveTo(at.left, at.top);
-
-    /* Dragged by its handle, for when the box covers something the reader
-       wants to see anyway.
-
-       The listeners go on the document, since the pointer leaves the handle
-       during a drag, and in the capture phase, since the box stops mouse
-       events from travelling further and would otherwise swallow the release
-       that ends the drag.
-
-       mousedown is prevented rather than allowed, which keeps focus in the
-       textarea. Letting focus go would blur it, and a blur saves and closes
-       the box, so the note would be filed away the moment you tried to move
-       it. */
-    const drag = new BoxDrag(moveTo);
-    const onMove = (e) => {
-      if (!drag.move(e.clientX, e.clientY, e.buttons)) detach();
-    };
-    const stopDrag = () => {
-      drag.stop();
-      detach();
-    };
-    function detach() {
-      document.removeEventListener('mousemove', onMove, true);
-      document.removeEventListener('mouseup', stopDrag, true);
+  /* Tells every sidebar showing this document that it changed. */
+  notify(doc) {
+    for (const sidebar of this.sidebars()) {
+      if (sidebar.doc === doc) sidebar.refresh();
     }
-    handle.addEventListener('mousedown', (e) => {
-      if (e.button !== 0) return;
-      e.preventDefault();
-      drag.start(e.clientX, e.clientY, at.left, at.top);
-      document.addEventListener('mousemove', onMove, true);
-      document.addEventListener('mouseup', stopDrag, true);
-    });
-    /* Each box settles exactly once. Removing it can blur the textarea, so
-       without this a discard on Esc would be undone by a save on blur, and a
-       box closed to make room for another would reach past itself and close
-       the replacement instead. */
-    let settled = false;
-    const finish = (save) => {
-      if (settled) return;
-      settled = true;
-      const value = textarea.value.trim();
-      if (this.noteBox === box) this.noteBox = null;
-      if (this.noteHistory === history) this.noteHistory = null;
-      stopDrag();
-      box.remove();
-      if (save) onCommit(value);
-    };
-    /* Lets closeNoteBox() retire this box without a save. */
-    box.mpaSettle = () => {
-      settled = true;
-      stopDrag();
-    };
+  }
 
-    textarea.addEventListener('blur', () => finish(true));
-    textarea.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        finish(false);
-      } else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-        e.preventDefault();
-        finish(true);
-      }
-    });
-    /* Keep the page handlers underneath from reacting to the box itself. */
-    for (const type of ['mousedown', 'mouseup', 'click', 'contextmenu']) {
-      box.addEventListener(type, (e) => e.stopPropagation());
+  /* The sidebar, made if there is none, and brought into view if asked. */
+  ensureSidebar(reveal) {
+    /* Two requests arriving together, such as the first PDF opening while a
+       highlight is clicked, would otherwise each make a sidebar. */
+    const pending = this.sidebarPending || Promise.resolve();
+    const next = pending.then(() => this.ensureSidebarNow(reveal));
+    this.sidebarPending = next.catch(() => null);
+    return next;
+  }
+
+  async ensureSidebarNow(reveal) {
+    const workspace = this.app.workspace;
+    let leaf = workspace.getLeavesOfType(SIDEBAR_VIEW_TYPE)[0];
+    if (!leaf) {
+      leaf = workspace.getRightLeaf(false);
+      if (!leaf) return null;
+      await leaf.setViewState({ type: SIDEBAR_VIEW_TYPE, active: false });
     }
-
-    this.noteBox = box;
-    textarea.focus();
+    if (reveal) await workspace.revealLeaf(leaf);
+    /* A sidebar tab that has not been looked at yet is a placeholder until it
+       is loaded. */
+    if (leaf.isDeferred && typeof leaf.loadIfDeferred === 'function') await leaf.loadIfDeferred();
+    return leaf.view instanceof AnnotationsView ? leaf.view : null;
   }
 
-  closeNoteBox() {
-    const box = this.noteBox;
-    if (!box) return;
-    this.noteBox = null;
-    this.noteHistory = null;
-    box.mpaSettle();
-    box.remove();
+  /* The sidebar comes into view by itself the first time a PDF is opened in a
+     session, so it is there without being asked for, the way Zotero's is.
+     Only once: if it is closed after that, it stays closed until something
+     needs it. */
+  maybeOpenSidebar() {
+    if (this.sidebarOffered) return;
+    this.sidebarOffered = true;
+    if (this.app.workspace.getLeavesOfType(SIDEBAR_VIEW_TYPE).length) return;
+    this.ensureSidebar(true).catch((e) => this.report('could not open the sidebar', e));
   }
 
-  /* Where a note box should appear: just below the thing the note belongs to.
+  /* Clicking a highlight or note marker in the document: its card, with the
+     cursor in its note. */
+  async revealAnnotation(doc, id, focusNote) {
+    const sidebar = await this.ensureSidebar(true);
+    if (!sidebar) return;
+    sidebar.setDoc(doc);
+    sidebar.showCard(id, { focusNote: !!focusNote });
+  }
 
-     Resolved here, when the box opens, rather than being carried from the
-     click that asked for it. A context-menu item runs after the menu has
-     closed, and by then a redraw may have replaced the element that was under
-     the pointer. A detached element measures as nothing, which put the box in
-     the top-left corner of the window. Looking the element up again by id
-     means the two ways of asking for a note behave identically.
-
-     The box goes below the whole of what it belongs to, so the words stay
-     readable while the note is being written. */
-  anchorFor(state, selector) {
-    /* Every piece of it, so a highlight running over several lines is cleared
-       in full rather than only its first line. */
-    let union = null;
-    for (const el of state.container.querySelectorAll(selector)) {
-      const rect = el.getBoundingClientRect();
-      if (!rect.width && !rect.height) continue;
-      if (!union) union = { left: rect.left, top: rect.top, bottom: rect.bottom };
-      else {
-        union.left = Math.min(union.left, rect.left);
-        union.top = Math.min(union.top, rect.top);
-        union.bottom = Math.max(union.bottom, rect.bottom);
-      }
+  /* A new highlight shows up in any sidebar that is already open, without
+     opening one or taking the keyboard away from the page. */
+  showInSidebar(doc, id) {
+    for (const sidebar of this.sidebars()) {
+      if (sidebar.doc === doc) sidebar.showCard(id, { focusNote: false });
     }
-    if (union) return union;
-    /* The thing is not on screen, so fall back to the pointer, and failing
-       that to the top of the view. */
-    const pointer = this.pointers.up || this.pointers.down;
-    if (pointer) return { left: pointer.x, top: pointer.y, bottom: pointer.y };
-    const box = state.container.getBoundingClientRect();
-    return { left: box.left + 20, top: box.top + 20, bottom: box.top + 20 };
   }
 
-  openHighlightNote(state, id) {
-    if (!this.canEdit(state.doc)) return;
-    const highlight = state.doc.data.highlights.find((h) => h.id === id);
-    if (!highlight) return;
-    const anchor = this.anchorFor(state, `.mpa-highlight[data-highlight-id="${id}"]`);
-    this.openNoteBox(anchor, highlight.note || '', (value) => {
-      if ((highlight.note || '') === value) return;
-      highlight.note = value;
-      this.commit(state.doc, value ? 'editing a note' : 'removing a note');
-    });
+  /* The open view showing a document, preferring the one used most recently. */
+  viewForDoc(doc) {
+    const focused = this.views.get(this.focusView);
+    if (focused && focused.doc === doc) return focused;
+    for (const state of this.views.values()) if (state.doc === doc) return state;
+    return null;
   }
 
-  openStandaloneNote(state, id) {
-    if (!this.canEdit(state.doc)) return;
-    const note = state.doc.data.notes.find((n) => n.id === id);
-    if (!note) return;
-    const anchor = this.anchorFor(state, `.mpa-note-icon[data-note-id="${id}"]`);
-    this.openNoteBox(anchor, note.text || '', (value) => {
-      if (!value) {
-        /* Emptying a standalone note deletes it: there is nothing left to
-           anchor its icon to. */
-        state.doc.data.notes = state.doc.data.notes.filter((n) => n.id !== note.id);
-      } else if (value === note.text) {
-        return;
-      } else {
-        note.text = value;
-      }
-      this.commit(state.doc, value ? 'editing a note' : 'removing a note');
-    });
+  /* Clicking a card's words: scrolls the document to them and marks them
+     briefly. Works from the page's own box, which exists for every page even
+     before the page is drawn. */
+  navigateTo(doc, id) {
+    const state = doc && this.viewForDoc(doc);
+    if (!state) return false;
+    const target = annotationTarget(doc.data, id);
+    const inner = pdfInnerOf(state.view);
+    if (!target || !inner || !inner.container) return false;
+
+    if (!state.container.isShown()) this.app.workspace.revealLeaf(state.view.leaf);
+    const pageEl = state.container.querySelector(`.page[data-page-number="${target.page}"]`);
+    const box = pageEl && pagePaddingBox(pageEl);
+    if (box) {
+      const scroller = inner.container;
+      const top = scroller.getBoundingClientRect().top;
+      scroller.scrollTop += box.top + target.y * box.height - top - scroller.clientHeight * 0.3;
+    } else {
+      inner.currentPageNumber = target.page;
+    }
+    state.flash = { id, since: Date.now(), until: Date.now() + FLASH_MS };
+    this.scheduleRedraw(state);
+    return true;
   }
 
+  /* Typing in a note box. Saved shortly after, and drawn at once so a note
+     marker appears or goes as the note does. Not yet an undo step: that is
+     filed once, when the box is left. */
+  setNote(doc, id, text) {
+    if (!doc || doc.readOnly) return;
+    const found = findAnnotation(doc.data, id);
+    if (!found) return;
+    if (found.kind === 'highlight') found.obj.note = text;
+    else found.obj.text = text;
+    doc.editing = true;
+    this.saveSoon(doc);
+    for (const state of this.views.values()) {
+      if (state.doc === doc) this.scheduleRedraw(state);
+    }
+  }
+
+  endNoteEdit(doc) {
+    if (!doc.editing) return;
+    doc.editing = false;
+    /* Typed and then rubbed out again: nothing to undo. */
+    if (JSON.stringify(doc.baseline) === JSON.stringify(snapshot(doc.data))) return;
+    this.commit(doc, 'editing a note');
+  }
+
+  deleteAnnotation(doc, id) {
+    if (!doc || !this.canEdit(doc)) return;
+    const found = findAnnotation(doc.data, id);
+    if (!found) return;
+    if (found.kind === 'highlight') {
+      doc.data.highlights = doc.data.highlights.filter((h) => h.id !== id);
+    } else {
+      doc.data.notes = doc.data.notes.filter((n) => n.id !== id);
+    }
+    this.commit(doc, found.kind === 'highlight' ? 'removing a highlight' : 'removing a note');
+  }
+
+  /* Right-clicking a bare part of a page. The note is made at once, empty,
+     and the cursor goes to its box in the sidebar. An empty note is kept, as
+     Zotero keeps one; it is removed from its card's menu. */
   addStandaloneNote(state, e, pageEl) {
     if (!this.canEdit(state.doc)) return;
-    const pageRect = pageEl.getBoundingClientRect();
-    if (!pageRect.width || !pageRect.height) return;
-    const position = {
-      x: (e.clientX - pageRect.left) / pageRect.width,
-      y: (e.clientY - pageRect.top) / pageRect.height,
+    const box = pagePaddingBox(pageEl);
+    if (!box) return;
+    const note = {
+      id: uuid(),
+      page: pageNumberOf(pageEl),
+      text: '',
+      position: { x: (e.clientX - box.left) / box.width, y: (e.clientY - box.top) / box.height },
+      createdAt: new Date().toISOString(),
     };
-    const page = pageNumberOf(pageEl);
+    state.doc.data.notes.push(note);
+    this.commit(state.doc, 'adding a note');
+    this.revealAnnotation(state.doc, note.id, true).catch((err) => this.report('could not show the note', err));
+  }
 
-    this.openNoteBox({ left: e.clientX, top: e.clientY, bottom: e.clientY }, '', (value) => {
-      if (!value) return;
-      state.doc.data.notes.push({
-        id: uuid(),
-        page,
-        text: value,
-        position,
-        createdAt: new Date().toISOString(),
-      });
-      this.commit(state.doc, 'adding a note');
-    });
+  /* Debounced save for typing, so a word is one write rather than one per
+     letter. */
+  saveSoon(doc) {
+    if (doc.saveTimer) window.clearTimeout(doc.saveTimer);
+    doc.saveTimer = window.setTimeout(() => {
+      doc.saveTimer = null;
+      this.queueSave(doc);
+    }, 400);
   }
 
   /* -------------------------------------------------------------- drawing */
@@ -1284,6 +1311,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
         el.style.setProperty('--mpa-w', pct(rect.w));
         el.style.setProperty('--mpa-h', pct(rect.h));
         el.style.setProperty('--mpa-color', color);
+        markFlash(el, state, highlight.id);
       }
 
       for (const item of items.icons) {
@@ -1291,6 +1319,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
            is in the stylesheet, so there is one rule for every marker. */
         const icon = this.createNoteIcon(layer, item.id, item.kind, item.color);
         icon.style.setProperty('--mpa-y', pct(item.y));
+        if (item.kind === 'note') markFlash(icon, state, item.id);
       }
     }
   }
@@ -1358,6 +1387,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     this.applyModeColor();
     this.updateStatusEl();
     for (const state of this.views.values()) this.render(state);
+    for (const sidebar of this.sidebars()) sidebar.refresh();
   }
 }
 
@@ -1520,6 +1550,279 @@ class MinimalPdfAnnotatorSettingTab extends PluginSettingTab {
   }
 }
 
+/* ------------------------------------------------------------------ sidebar
+
+   The annotations sidebar, after Zotero's. One card per highlight or note on
+   the document in front of you: the highlighted words, and an "Add note" box
+   under them. Clicking the words takes you to them in the document; clicking
+   a highlight in the document puts you in its box here. Every change in either
+   place is the same change, made once, through the plugin. */
+
+/* Whether the browser can grow a text box to fit its contents by itself. Where
+   it cannot, the sidebar does it by measuring. */
+const FIELD_SIZING =
+  typeof CSS !== 'undefined' && typeof CSS.supports === 'function' && CSS.supports('field-sizing', 'content');
+
+class AnnotationsView extends ItemView {
+  constructor(leaf, plugin) {
+    super(leaf);
+    this.plugin = plugin;
+    /* undefined until opened, so the first setDoc always draws. */
+    this.doc = undefined;
+    /** @type {Map<string, Card>} */
+    this.cards = new Map();
+    this.selectedId = null;
+  }
+
+  getViewType() {
+    return SIDEBAR_VIEW_TYPE;
+  }
+
+  getDisplayText() {
+    return 'Annotations';
+  }
+
+  getIcon() {
+    return 'highlighter';
+  }
+
+  async onOpen() {
+    const root = this.contentEl;
+    root.empty();
+    root.addClass('mpa-sidebar');
+    this.listEl = root.createDiv({ cls: 'mpa-sidebar-list' });
+    this.emptyEl = root.createDiv({ cls: 'mpa-sidebar-empty' });
+    this.doc = undefined;
+    this.setDoc(this.plugin.focusDoc());
+  }
+
+  async onClose() {
+    this.cards.clear();
+    this.listEl = null;
+  }
+
+  /* Shows a different document, or refreshes the one already shown. */
+  setDoc(doc) {
+    if (!this.listEl) return;
+    if (doc === this.doc) {
+      this.refresh();
+      return;
+    }
+    /* A note being typed belongs to the document being left. Filed now, while
+       that is still the document in hand: emptying the list below takes the
+       cursor out of the box, and by the time that is noticed, the sidebar
+       would already be showing the other document. */
+    if (this.doc && this.doc.editing) this.plugin.endNoteEdit(this.doc);
+    this.doc = doc;
+    this.selectedId = null;
+    this.listEl.empty();
+    this.cards.clear();
+    this.refresh();
+  }
+
+  items() {
+    return this.doc ? annotationItems(this.doc.data, this.plugin.settings.sidebarSort) : [];
+  }
+
+  /* Brings the cards in line with the annotations, touching only what
+     changed. Rebuilding the list wholesale would take the cursor out of a note
+     being typed whenever anything else in the document changed. */
+  refresh() {
+    if (!this.listEl) return;
+    const items = this.items();
+
+    this.emptyEl.toggle(!this.doc || !items.length);
+    this.emptyEl.setText(
+      !this.doc
+        ? 'Open a PDF to see its annotations here.'
+        : 'No annotations yet. Turn on highlight mode and select some text.'
+    );
+
+    const wanted = new Set(items.map((item) => item.id));
+    for (const [id, card] of this.cards) {
+      if (wanted.has(id)) continue;
+      card.el.remove();
+      this.cards.delete(id);
+    }
+
+    let previous = null;
+    for (const item of items) {
+      let card = this.cards.get(item.id);
+      const fresh = !card;
+      if (fresh) {
+        card = this.buildCard(item);
+        this.cards.set(item.id, card);
+      }
+      /* Moved only when out of place: moving an element takes the focus out
+         of anything inside it. */
+      const slot = previous ? previous.el.nextSibling : this.listEl.firstChild;
+      if (card.el !== slot) this.listEl.insertBefore(card.el, slot);
+      this.updateCard(card, item);
+      if (fresh) this.fit(card.note);
+      previous = card;
+    }
+  }
+
+  buildCard(item) {
+    /** @type {Card} */
+    const card = { id: item.id, kind: item.kind, doc: this.doc };
+    /* The kind as its own class, kept apart from the card's parts: "mpa-card-note"
+       is the note box inside every card. */
+    const el = (card.el = createDiv({ cls: `mpa-card mpa-kind-${item.kind}` }));
+    el.tabIndex = 0;
+    el.dataset.id = item.id;
+
+    const head = el.createDiv({ cls: 'mpa-card-head' });
+    if (item.kind === 'highlight') {
+      card.quote = head.createDiv({ cls: 'mpa-card-quote' });
+      card.quote.addEventListener('click', () => this.activate(card));
+    } else {
+      /* A note of its own has no words to click, so its header does the same
+         job: it takes you to where the note was put. */
+      const label = head.createDiv({ cls: 'mpa-card-label', attr: { 'aria-label': 'Go to note' } });
+      setIcon(label, 'sticky-note');
+      label.addEventListener('click', () => this.activate(card));
+    }
+
+    const more = head.createDiv({ cls: 'mpa-card-more clickable-icon', attr: { 'aria-label': 'More' } });
+    setIcon(more, 'more-horizontal');
+    more.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.openMenu(card, e);
+    });
+
+    card.note = el.createEl('textarea', {
+      cls: 'mpa-card-note',
+      attr: { placeholder: 'Add note', rows: '1' },
+    });
+    this.wireNote(card);
+
+    el.addEventListener('keydown', (e) => {
+      if (e.target !== el) return;
+      if (e.key === 'Delete' || e.key === 'Backspace') {
+        e.preventDefault();
+        this.plugin.deleteAnnotation(card.doc, card.id);
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        this.activate(card);
+      }
+    });
+    el.addEventListener('focusin', () => this.select(card.id));
+    return card;
+  }
+
+  updateCard(card, item) {
+    const settings = this.plugin.settings;
+    const color = HEX_COLOR_RE.test(item.obj.color || '') ? item.obj.color : settings.highlightColor;
+    card.el.style.setProperty('--mpa-color', color);
+    card.el.toggleClass('is-selected', this.selectedId === card.id);
+
+    if (card.quote) {
+      const text = collapseWhitespace(item.obj.text || '');
+      if (card.quote.textContent !== text) card.quote.setText(text);
+    }
+
+    /* A note being typed is left alone: what is in the box is newer than
+       anything this could put there. */
+    const note = item.kind === 'highlight' ? item.obj.note || '' : item.obj.text || '';
+    if (document.activeElement !== card.note && card.note.value !== note) {
+      card.note.value = note;
+      this.fit(card.note);
+    }
+    card.note.readOnly = !!(this.doc && this.doc.readOnly);
+  }
+
+  /* A note box saves as it is typed in, as Zotero's does, with no button.
+     Its undo keys step through the typing in pauses, like the rest of
+     Obsidian, through a history of its own. Leaving the box files the whole
+     edit as one step in the document's undo history. */
+  wireNote(card) {
+    const plugin = this.plugin;
+    const field = card.note;
+    /* The card's own document, not whatever the sidebar shows by the time an
+       event arrives. */
+    const doc = card.doc;
+    const sync = () => {
+      if (!doc) return;
+      plugin.setNote(doc, card.id, field.value);
+      this.fit(field);
+    };
+    field.addEventListener('focus', () => {
+      plugin.noteFields.set(field, { history: new NoteHistory(field), sync });
+      this.select(card.id);
+    });
+    field.addEventListener('input', () => {
+      const entry = plugin.noteFields.get(field);
+      if (entry) entry.history.record(Date.now());
+      sync();
+    });
+    field.addEventListener('blur', () => {
+      plugin.noteFields.delete(field);
+      if (doc) plugin.endNoteEdit(doc);
+    });
+    /* Esc leaves the box. Focus does not move to the card: there, Delete and
+       Backspace delete the whole annotation, and a Backspace pressed out of
+       habit straight after Esc would take the highlight with it. */
+    field.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape') return;
+      e.preventDefault();
+      field.blur();
+    });
+  }
+
+  /* Grows a note box to fit what is in it, where the browser cannot. */
+  fit(field) {
+    if (FIELD_SIZING || !field.isConnected) return;
+    field.style.setProperty('--mpa-note-height', 'auto');
+    field.style.setProperty('--mpa-note-height', `${field.scrollHeight}px`);
+  }
+
+  /* Clicking a card's words. */
+  activate(card) {
+    this.select(card.id);
+    this.plugin.navigateTo(card.doc, card.id);
+  }
+
+  select(id) {
+    if (this.selectedId === id) return;
+    const previous = this.cards.get(this.selectedId);
+    if (previous) previous.el.removeClass('is-selected');
+    this.selectedId = id;
+    const card = this.cards.get(id);
+    if (card) card.el.addClass('is-selected');
+  }
+
+  openMenu(card, e) {
+    const menu = new Menu();
+    menu.addItem((item) =>
+      item
+        .setTitle(card.kind === 'highlight' ? 'Delete highlight' : 'Delete note')
+        .setIcon('trash')
+        .onClick(() => this.plugin.deleteAnnotation(card.doc, card.id))
+    );
+    menu.showAtMouseEvent(e);
+  }
+
+  /* Scrolls a card into view, briefly marks it, and optionally puts the
+     cursor at the end of its note. */
+  showCard(id, options) {
+    const opts = options || {};
+    this.refresh();
+    const card = this.cards.get(id);
+    if (!card) return;
+    if (opts.select !== false) this.select(id);
+    card.el.scrollIntoView({ block: 'nearest' });
+    card.el.removeClass('mpa-flash');
+    void card.el.offsetWidth;
+    card.el.addClass('mpa-flash');
+    if (opts.focusNote) {
+      card.note.focus();
+      const end = card.note.value.length;
+      card.note.setSelectionRange(end, end);
+    }
+  }
+}
+
 /* ----------------------------------------------------------------- helpers */
 
 function round(n) {
@@ -1617,49 +1920,9 @@ function pruneZooms(zooms, limit) {
   return zooms;
 }
 
-/* A drag of the note box, in progress.
-
-   Kept apart from the event wiring so the rules can be checked without a
-   mouse. There are two of them, and both exist because a release can go
-   missing: the box stops mouse events from travelling further, to keep the
-   page handlers underneath from reacting to it, and a button let go outside
-   the window is never reported at all. So a move with no button held ends the
-   drag, and a move after it has ended does nothing. */
-class BoxDrag {
-  constructor(onMove) {
-    this.onMove = onMove;
-    this.from = null;
-  }
-
-  get active() {
-    return this.from !== null;
-  }
-
-  start(x, y, left, top) {
-    this.from = { x, y, left, top };
-  }
-
-  /* Returns whether the drag is still live afterwards. */
-  move(x, y, buttons) {
-    if (!this.from) return false;
-    if (!buttons) {
-      this.stop();
-      return false;
-    }
-    this.onMove(this.from.left + (x - this.from.x), this.from.top + (y - this.from.y));
-    return true;
-  }
-
-  stop() {
-    const was = this.active;
-    this.from = null;
-    return was;
-  }
-}
-
 /* Undo inside a note box.
 
-   A textarea comes with the browser's own undo, which steps through a typed
+   A text box comes with the browser's own undo, which steps through a typed
    run one character at a time. The rest of Obsidian does not behave that way:
    CodeMirror starts a new undo step only when you pause, so a burst of typing
    comes back as a burst. Rather than leave the note box feeling foreign, this
@@ -2144,6 +2407,95 @@ function migrateHighlight(highlight) {
   return migrated;
 }
 
+/* Every annotation on a document as a flat, ordered list, which is what the
+   sidebar shows and the transcript follows. 'position' is reading order: page,
+   then down the page. 'date' is the order they were made in, oldest first. */
+function annotationItems(data, sort) {
+  const items = [];
+  for (const h of (data && data.highlights) || []) {
+    const first = firstRect(h);
+    items.push({
+      id: h.id,
+      kind: 'highlight',
+      obj: h,
+      order: first ? [first.page, first.y, first.x] : [0, 0, 0],
+      createdAt: h.createdAt || '',
+    });
+  }
+  for (const n of (data && data.notes) || []) {
+    const p = n.position || {};
+    items.push({
+      id: n.id,
+      kind: 'note',
+      obj: n,
+      order: [n.page || 0, p.y || 0, p.x || 0],
+      createdAt: n.createdAt || '',
+    });
+  }
+  const byPosition = (a, b) => compareOrder(a.order, b.order);
+  const byDate = (a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : byPosition(a, b));
+  return items.sort(sort === 'date' ? byDate : byPosition);
+}
+
+function compareOrder(a, b) {
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const d = (a[i] || 0) - (b[i] || 0);
+    if (d) return d;
+  }
+  return 0;
+}
+
+function findAnnotation(data, id) {
+  const h = ((data && data.highlights) || []).find((x) => x.id === id);
+  if (h) return { kind: 'highlight', obj: h };
+  const n = ((data && data.notes) || []).find((x) => x.id === id);
+  return n ? { kind: 'note', obj: n } : null;
+}
+
+/* Where to take the reader for an annotation: its page, and how far down. */
+function annotationTarget(data, id) {
+  const found = findAnnotation(data, id);
+  if (!found) return null;
+  if (found.kind === 'highlight') {
+    const first = firstRect(found.obj);
+    return first ? { page: first.page, y: first.y } : null;
+  }
+  const p = found.obj.position || {};
+  return { page: found.obj.page || 1, y: p.y || 0 };
+}
+
+/* How long an annotation is pointed out for after navigating to it, which is
+   also the length of the animation in styles.css. */
+const FLASH_MS = 1200;
+
+/* Whether an annotation is being pointed out after navigating to it. */
+function flashing(state, id) {
+  return !!(state.flash && state.flash.id === id && Date.now() < state.flash.until);
+}
+
+/* How far into its animation a pointed-out annotation is. The page redraws
+   several times while it scrolls into place, replacing these elements, and a
+   fresh element would otherwise start its animation again from the top. */
+function flashElapsed(state, id) {
+  if (!flashing(state, id)) return null;
+  return Math.max(0, Date.now() - (state.flash.since || Date.now()));
+}
+
+function markFlash(el, state, id) {
+  const elapsed = flashElapsed(state, id);
+  if (elapsed === null) return;
+  el.style.setProperty('--mpa-flash-delay', `-${elapsed}ms`);
+  el.addClass('mpa-flash');
+}
+
+/* The PDF.js viewer behind a PDF view, without the zoom check pdfViewerOf
+   makes: navigation needs the viewer even before a zoom has been set. */
+function pdfInnerOf(view) {
+  const child = view && view.viewer && view.viewer.child;
+  const wrapper = child && child.pdfViewer;
+  return (wrapper && wrapper.pdfViewer) || null;
+}
+
 /* Where a highlight starts: the earliest page it touches, and the topmost
    rectangle on that page. Used for ordering it in the transcript and for
    placing its note marker. */
@@ -2159,15 +2511,7 @@ function firstRect(highlight) {
    their notes indented beneath, standalone notes as plain bullets. Pure, so it
    can be checked without a vault. */
 function renderMarkdown(data) {
-  const items = [];
-  for (const h of data.highlights || []) {
-    const first = firstRect(h);
-    items.push({ page: first ? first.page : 0, y: first ? first.y : 0, kind: 'highlight', obj: h });
-  }
-  for (const n of data.notes || []) {
-    items.push({ page: n.page || 0, y: n.position ? n.position.y : 0, kind: 'note', obj: n });
-  }
-  items.sort((a, b) => a.page - b.page || a.y - b.y);
+  const items = annotationItems(data, 'position');
 
   let md = '';
   for (const { kind, obj } of items) {
@@ -2212,4 +2556,13 @@ module.exports = MinimalPdfAnnotatorPlugin;
  * @property {MutationObserver | null} observer
  * @property {number} frame                   pending animation-frame redraw
  * @property {string | null} pendingZoom       a remembered zoom not yet applied
+ * @property {{id: string, until: number}} [flash] an annotation being pointed out
+ *
+ * @typedef {Object} Card
+ * @property {string} id
+ * @property {'highlight' | 'note'} kind
+ * @property {HTMLElement} el
+ * @property {HTMLElement} [quote]
+ * @property {HTMLTextAreaElement} note
+ * @property {DocState | null} doc  the document the card was built for
  */
