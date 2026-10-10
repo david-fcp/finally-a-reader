@@ -85,3 +85,20 @@ In `main.js`, under the heading "the character model": `buildChars()`,
 `snapEnd()` and `selectedSlice()`. All of the pure ones are covered in
 `tests/test-markdown.js`, so a fix can be written against a test before being
 tried in the app.
+
+## Other limitations
+
+These aren't selection problems, but they are known and not yet handled.
+
+- **Pop-out windows.** The plugin listens for clicks, keys and hovers in
+  Obsidian's main window only. In a document moved to a pop-out window,
+  highlights are drawn but clicking them, the undo keys and footnote
+  previews do nothing.
+- **A PDF page turned on its side** gets no footnote preview. Its markers
+  still jump when clicked.
+- **A book highlight across two chapters**, whose place stops matching its
+  words after the book file changes, is not looked for again. It stays in the
+  sidebar but isn't drawn. A highlight within one chapter is found again.
+- **Dragging out of a book.** A selection that ends with the mouse released
+  outside the book's frame, over the sidebar say, may make no highlight.
+- **Mobile.** Nothing has been tried on Obsidian's mobile apps.
