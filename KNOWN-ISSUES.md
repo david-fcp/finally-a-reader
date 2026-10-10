@@ -2,9 +2,8 @@
 
 Open problems in selection accuracy, parked on 9 October 2026 to be picked up
 in a later session. Everything here is about where a highlight's two boundaries
-land, which is the hardest part of this plugin. Large highlights, the
-transcript, the markdown ownership guard, undo-free editing and the rest are
-behaving.
+land, which is the hardest part of this plugin. Large highlights, undo and
+the rest are behaving.
 
 Reproduce any of these with the command **Report what the current selection
 looks like**, which writes `Minimal PDF annotator selection report.md` at the

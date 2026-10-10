@@ -10,7 +10,9 @@
  * land in its box. Right-click a bare part of a page for a note of its own.
  *
  * The annotations are kept in <name>.annotations.json beside the PDF, the one
- * source of truth for both the document and the sidebar.
+ * source of truth for both the document and the sidebar. A button in the
+ * sidebar makes a markdown note of them on request; nothing is written to
+ * markdown otherwise.
  */
 
 const {
@@ -34,6 +36,11 @@ const DEFAULT_SETTINGS = {
   rememberZoom: true,
   /* 'position' or 'date'. */
   sidebarSort: 'position',
+  /* How the note made from the annotations is laid out. See renderExport. */
+  quoteMarks: 'double',
+  highlightLayout: 'bullets',
+  noteLayout: 'indented-bullet',
+  looseNoteLayout: 'bullets',
 };
 
 const HEX_COLOR_RE = /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
@@ -115,6 +122,17 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
       name: 'Open annotations sidebar',
       callback: () => {
         this.ensureSidebar(true).catch((e) => this.report('could not open the sidebar', e));
+      },
+    });
+
+    this.addCommand({
+      id: 'create-note',
+      name: 'Create note from annotations',
+      checkCallback: (checking) => {
+        const doc = this.focusDoc();
+        if (!doc) return false;
+        if (!checking) this.exportNote(doc).catch((e) => this.report('could not create the note', e));
+        return true;
       },
     });
 
@@ -411,10 +429,6 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     return pdfFile.path.replace(/\.pdf$/i, '') + '.annotations.json';
   }
 
-  getMarkdownPath(pdfFile) {
-    return pdfFile.path.replace(/\.pdf$/i, '') + '.md';
-  }
-
   async loadDoc(file) {
     const existing = this.docs.get(file.path);
     if (existing) return existing;
@@ -430,7 +444,6 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
       data: loaded.data,
       readOnly: !loaded.ok,
       saveChain: Promise.resolve(),
-      markdownWarned: false,
       sidecarStamp: null,
       /* The state as of the last change, which is what commit() pushes. */
       baseline: snapshot(loaded.data),
@@ -447,7 +460,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
   async readSidecar(pdfFile) {
     const path = this.getSidecarPath(pdfFile);
     const file = this.app.vault.getAbstractFileByPath(path);
-    const empty = { highlights: [], notes: [], markdownStamp: null };
+    const empty = { highlights: [], notes: [] };
     if (!(file instanceof TFile)) return { data: empty, ok: true };
     try {
       const parsed = JSON.parse(await this.app.vault.read(file));
@@ -457,7 +470,6 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
         data: {
           highlights: highlights.map(migrateHighlight),
           notes: Array.isArray(parsed.notes) ? parsed.notes : [],
-          markdownStamp: typeof parsed.markdownStamp === 'string' ? parsed.markdownStamp : null,
         },
       };
     } catch (e) {
@@ -487,7 +499,6 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
   }
 
   async save(doc) {
-    await this.writeMarkdown(doc);
     const path = this.getSidecarPath(doc.file);
     const content = JSON.stringify(doc.data, null, 2) + '\n';
     /* Recorded before the write, not after. The vault's change event can
@@ -501,48 +512,29 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     else await this.app.vault.create(path, content);
   }
 
-  /* The markdown file is generated, so it gets overwritten on every change.
-     That is only safe for a file this plugin wrote: "<name>.md" next to
-     "<name>.pdf" is exactly what someone taking notes on a PDF by hand would
-     call their note, and silently replacing it would destroy their work.
-
-     So a stamp of the last generated text is kept in the sidecar, and the file
-     is only rewritten when what is on disk is what we last put there. Anything
-     else is somebody's own note: leave it alone and say so once. */
-  async writeMarkdown(doc) {
-    const path = this.getMarkdownPath(doc.file);
-    const md = renderMarkdown(doc.data);
-    const existing = this.app.vault.getAbstractFileByPath(path);
-
-    if (!(existing instanceof TFile)) {
-      if (!md) return;
-      await this.app.vault.create(path, md);
-      doc.data.markdownStamp = stamp(md);
-      /* The one thing worth saying out loud: a file has appeared in the vault
-         that was not there before, and where it appeared is not obvious. */
-      new Notice(`Created ${path}`);
+  /* A markdown note of every annotation on the document, beside it and named
+     after it, opened in a new tab. Made fresh each time and never touched
+     again, so it is the reader's to edit: a name already taken gets a number
+     rather than being written over. */
+  async exportNote(doc) {
+    if (!doc) return;
+    const md = renderExport(doc.data, this.settings);
+    if (!md) {
+      new Notice('There are no annotations to make a note of yet.');
       return;
     }
-
-    const current = await this.app.vault.read(existing);
-    const ours = doc.data.markdownStamp === stamp(current);
-    /* Already byte-identical to what we would write: ours, or in sync with it,
-       either way safe to adopt. This is also what upgrades a file generated
-       before stamps were recorded. */
-    if (!ours && current !== md) {
-      if (!doc.markdownWarned) {
-        doc.markdownWarned = true;
-        new Notice(
-          `${path} was not written by this plugin, so it has been left alone. ` +
-            'Your highlights are safe in the .annotations.json file beside it.',
-          10000
-        );
-      }
-      return;
-    }
-
-    if (current !== md) await this.app.vault.modify(existing, md);
-    doc.data.markdownStamp = stamp(md);
+    const base = doc.file.path.replace(/\.[^./]+$/, '');
+    let path = normalizePath(`${base}.md`);
+    /* Also asked of the disk, which on most Macs and PCs ignores case, so
+       "Paper.md" counts as taken by "paper.md". */
+    const taken = async (p) =>
+      !!this.app.vault.getAbstractFileByPath(p) || (await this.app.vault.adapter.exists(p));
+    for (let n = 1; await taken(path); n++) path = normalizePath(`${base} ${n}.md`);
+    const file = await this.app.vault.create(path, md);
+    new Notice(`Created ${path}`);
+    const leaf = this.app.workspace.getLeaf('tab');
+    await leaf.openFile(file);
+    this.app.workspace.setActiveLeaf(leaf, { focus: true });
   }
 
   /* The settings tab's explanatory text, from the editable file beside the
@@ -553,7 +545,12 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     const path = normalizePath(`${dir}/${HELP_FILE}`);
     const adapter = this.app.vault.adapter;
     try {
-      if (await adapter.exists(path)) return await adapter.read(path);
+      if (await adapter.exists(path)) {
+        const text = await adapter.read(path);
+        /* Written by an earlier version and never edited: the newer wording
+           replaces it. An edited copy is the reader's and is kept. */
+        if (!OLD_HELP_STAMPS.includes(stamp(text))) return text;
+      }
       await adapter.write(path, DEFAULT_HELP);
     } catch (e) {
       this.report(`could not read or create ${path}, using the built-in text`, e);
@@ -696,7 +693,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
 
     /* A note asked for on top of a highlight belongs to that highlight, not to
        the point on the page. Making a standalone note there instead left it
-       with nothing to sit under in the transcript, and gave the highlight two
+       with nothing to sit under in an exported note, and gave the highlight two
        separate things attached to the same words. */
     if (iconKind === 'note') {
       menu.addItem((item) =>
@@ -1281,7 +1278,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
          marker where the page was right-clicked meant it sat on top of the
          words there, which is the thing the margin exists to avoid. Where it
          was put is still recorded, and still decides its place in the
-         transcript; only the marker moves. */
+         sidebar and in an exported note; only the marker moves. */
       const position = note.position || { x: 0, y: 0 };
       bucket(note.page).icons.push({
         id: note.id,
@@ -1380,6 +1377,16 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     }
     this.settings.snapToWords = this.settings.snapToWords !== false;
     this.settings.rememberZoom = this.settings.rememberZoom !== false;
+    const valid = {
+      quoteMarks: Object.keys(QUOTE_MARKS),
+      highlightLayout: Object.keys(LAYOUT_SHAPES),
+      noteLayout: ['indented-bullet', 'line', 'paragraph', 'same-line'],
+      looseNoteLayout: Object.keys(LAYOUT_SHAPES),
+      sidebarSort: ['position', 'date'],
+    };
+    for (const [key, allowed] of Object.entries(valid)) {
+      if (!allowed.includes(this.settings[key])) this.settings[key] = DEFAULT_SETTINGS[key];
+    }
   }
 
   async setSidebarSort(sort) {
@@ -1408,29 +1415,44 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
    overwritten after that, so an edit survives. */
 const HELP_FILE = 'settings-help.md';
 
+/* Stamps of help text written out by earlier versions, so an unedited copy
+   can be recognised and brought up to date. Add the current text's stamp
+   here whenever DEFAULT_HELP changes. */
+const OLD_HELP_STAMPS = ['41f1859b-3282'];
+
 const DEFAULT_HELP = `## How it works
 
 Turn on highlight mode from the ribbon, the status bar or the PDF toolbar, then
 select text in a PDF to highlight it.
 
-- **Click a highlight** to attach a note to it.
-- **Right-click a highlight** to add or edit its note, or to remove either.
-- **Right-click a blank part of a page** for "Add note", which anchors a note
-  of its own at that point.
+The annotations sidebar lists every highlight and note on the PDF in front of
+you. It opens by itself the first time you open a PDF, and the command **Open
+annotations sidebar** brings it back.
 
-Every note is marked by a small icon in the page's left margin, level with the
-thing it refers to, so a marker never covers the text it belongs to.
+- **Click a card's words** to go to that place in the PDF.
+- **Type in "Add note"** under a highlight to annotate it. Notes save as you
+  type.
+- **Click a highlight in the PDF** to land in its note box in the sidebar.
+- **Right-click a bare part of a page** for "Add note", which makes a note of
+  its own at that point.
+- **Delete** a highlight or note from the ··· menu on its card, or by
+  selecting the card and pressing Delete.
 
-A note box opens below everything it belongs to, so the words stay readable
-while you write. Drag the strip along its top to move it.
+A highlight longer than five lines is cut short in the sidebar. Click it once
+to read all of it, and again to go to it.
 
-In a note box, Cmd or Ctrl with Enter saves, and Esc discards. Clicking away
-saves. A selection that runs across a page break is one highlight, so removing
-it removes the whole thing.
+**Search annotations** at the top of the sidebar filters the cards as you type,
+forgiving a slip or two in each word. Clicking a result shows it among all the
+others; clicking it again goes to it in the PDF. The button beside the search
+box switches between the order things appear in and the order you added them.
 
-A highlight covers exactly the characters it transcribes. Where a drag ends
-between two letters, the one nearer your pointer wins, and unless you turn off
-snapping above, the whole word is taken.
+## Making a note
+
+The note button at the top of the sidebar creates a note with the same name as
+the PDF, beside it, holding every highlight and note in reading order, and
+opens it. If that name is taken, a number is added. The note is yours: the
+plugin never changes it afterwards, so make another when you want an updated
+copy. How it is laid out is set above.
 
 ## Undoing
 
@@ -1455,22 +1477,13 @@ document that no longer exists.
 
 Each PDF reopens at the zoom you last read it at. This is kept per device,
 since a comfortable zoom depends on the screen in front of you, so it is not
-carried between machines. Turn it off in the settings above to have every PDF
-open at Obsidian's own default.
+carried between machines.
 
 ## Where your annotations live
 
-Two files sit beside each PDF. For \`refs/paper.pdf\` you get:
-
-**\`refs/paper.annotations.json\`** holds the annotations, and is the only copy
-of them. Keep it alongside the PDF when you move things around.
-
-**\`refs/paper.md\`** is a transcript of them, so highlights are searchable and
-linkable as ordinary markdown. It is regenerated on every change, so edits to it
-are not read back and will be replaced.
-
-If a note of your own is already at that path, it is left untouched and no
-transcript is written. Your highlights are still safe in the JSON file.
+For \`refs/paper.pdf\`, the annotations are kept in
+\`refs/paper.annotations.json\` beside it. That file is the only copy of them, so
+keep it with the PDF when you move things around.
 
 ## When a highlight comes out wrong
 
@@ -1495,43 +1508,69 @@ class MinimalPdfAnnotatorSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
+    const settings = this.plugin.settings;
+    const save = async (key, value) => {
+      settings[key] = value;
+      await this.plugin.saveSettings();
+    };
+
+    new Setting(containerEl)
+      .setName('Snap highlight to whole words')
+      .setDesc(
+        'For boring reasons, highlights can be inaccurate. If you often want to highlight half ' +
+          'a word, turn this off. Otherwise, this toggle should improve performance.'
+      )
+      .addToggle((toggle) => toggle.setValue(settings.snapToWords).onChange((v) => save('snapToWords', v)));
+
+    new Setting(containerEl)
+      .setName('Highlight colour')
+      .setDesc('Used for new highlights. Existing ones keep the colour they were made with.')
+      .addColorPicker((picker) =>
+        picker.setValue(settings.highlightColor).onChange(async (value) => {
+          if (!HEX_COLOR_RE.test(value)) return;
+          await save('highlightColor', value);
+        })
+      );
+
+    const choice = (name, key, options) =>
+      new Setting(containerEl)
+        .setName(name)
+        .addDropdown((dropdown) =>
+          dropdown
+            .addOptions(options)
+            .setValue(settings[key])
+            .onChange((v) => save(key, v))
+        );
+
+    choice('Highlighted text is enclosed in', 'quoteMarks', {
+      single: "Single quotation marks ('')",
+      double: 'Double quotation marks ("")',
+      none: 'Nothing',
+    });
+    choice('Highlighted text appears in the .md file as', 'highlightLayout', {
+      bullets: 'new bullets',
+      lines: 'new lines',
+      paragraphs: 'new paragraphs',
+    });
+    choice('Each note attached to highlighted text appears in the .md file', 'noteLayout', {
+      'indented-bullet': 'as a bullet indented under the highlighted text',
+      line: 'on a new line under the highlighted text',
+      paragraph: 'in a new paragraph under the highlighted text',
+      'same-line': 'on the same line as the highlighted text',
+    });
+    choice('Notes that aren\u2019t attached to highlighted text appear in the .md file as', 'looseNoteLayout', {
+      bullets: 'new bullets',
+      lines: 'new lines',
+      paragraphs: 'new paragraphs',
+    });
+
     new Setting(containerEl)
       .setName('Remember each PDF\u2019s zoom level')
       .setDesc(
         'Reopen a PDF at the zoom you last read it at. Kept per device, since a comfortable ' +
           'zoom depends on the screen, so it is not carried between machines.'
       )
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.rememberZoom).onChange(async (value) => {
-          this.plugin.settings.rememberZoom = value;
-          await this.plugin.saveSettings();
-        })
-      );
-
-    new Setting(containerEl)
-      .setName('Snap highlights to whole words')
-      .setDesc(
-        'A PDF viewer stretches its text to match the document, so dragging to the end of a ' +
-          'word often stops one letter short. With this on, a highlight is widened to the ' +
-          'words it covers. Turn it off to keep exactly what you selected.'
-      )
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.snapToWords).onChange(async (value) => {
-          this.plugin.settings.snapToWords = value;
-          await this.plugin.saveSettings();
-        })
-      );
-
-    new Setting(containerEl)
-      .setName('Highlight colour')
-      .setDesc('Used for new highlights. Existing ones keep the colour they were made with.')
-      .addColorPicker((picker) =>
-        picker.setValue(this.plugin.settings.highlightColor).onChange(async (value) => {
-          if (!HEX_COLOR_RE.test(value)) return;
-          this.plugin.settings.highlightColor = value;
-          await this.plugin.saveSettings();
-        })
-      );
+      .addToggle((toggle) => toggle.setValue(settings.rememberZoom).onChange((v) => save('rememberZoom', v)));
 
     /* Reading the file is asynchronous and display() is not, so the text is
        rendered into a container that is already in place. */
@@ -1665,6 +1704,16 @@ class AnnotationsView extends ItemView {
       this.plugin.setSidebarSort(this.plugin.settings.sidebarSort === 'date' ? 'position' : 'date');
     });
     this.updateSortButton();
+
+    const exportEl = header.createDiv({
+      cls: 'clickable-icon mpa-export',
+      attr: { 'aria-label': 'Create a note from these annotations' },
+    });
+    setIcon(exportEl, 'file-plus');
+    exportEl.addEventListener('click', () => {
+      if (!this.doc) return;
+      this.plugin.exportNote(this.doc).catch((e) => this.plugin.report('could not create the note', e));
+    });
   }
 
   updateSortButton() {
@@ -2166,11 +2215,8 @@ class NoteHistory {
    restore that puts back a known-good state cannot get the bookkeeping wrong
    the way an inverse operation can.
 
-   markdownStamp is left out on purpose. It records whether the generated
-   markdown file is still the one this plugin wrote, which is a fact about the
-   file on disk, not about the annotations. Restoring an old one would make the
-   plugin think somebody else's note had appeared at that path and stop writing
-   the transcript. */
+   Only the annotations themselves: anything else a sidecar might carry is
+   not part of what an undo restores. */
 function snapshot(data) {
   return {
     highlights: JSON.parse(JSON.stringify(data.highlights || [])),
@@ -2219,7 +2265,7 @@ function pagePaddingBox(pageEl) {
    The earlier design read the text from character offsets and the rectangles
    from the browser's own selection geometry. Those are two answers to the same
    question, and they disagreed by a glyph: a highlight would stretch over a
-   full stop the transcript left out, or the transcript would carry one the
+   full stop the stored text left out, or the text would carry one the
    highlight did not cover. Zotero avoids this by keeping its own character
    positions and taking both answers from one of them. This is the same idea,
    measured through the DOM instead of through the PDF's font metrics. */
@@ -2588,7 +2634,7 @@ function migrateHighlight(highlight) {
 }
 
 /* Every annotation on a document as a flat, ordered list, which is what the
-   sidebar shows and the transcript follows. 'position' is reading order: page,
+   sidebar shows and an exported note follows. 'position' is reading order: page,
    then down the page. 'date' is the order they were made in, oldest first. */
 function annotationItems(data, sort) {
   const items = [];
@@ -2736,7 +2782,7 @@ function pdfInnerOf(view) {
 }
 
 /* Where a highlight starts: the earliest page it touches, and the topmost
-   rectangle on that page. Used for ordering it in the transcript and for
+   rectangle on that page. Used for ordering it and for
    placing its note marker. */
 function firstRect(highlight) {
   let best = null;
@@ -2746,25 +2792,98 @@ function firstRect(highlight) {
   return best;
 }
 
-/* The generated transcript: highlights as quoted bullets in reading order,
-   their notes indented beneath, standalone notes as plain bullets. Pure, so it
-   can be checked without a vault. */
-function renderMarkdown(data) {
-  const items = annotationItems(data, 'position');
+/* The note made by the sidebar's export button: every annotation in reading
+   order, laid out as the settings say. Pure, so it can be checked without a
+   vault.
 
-  let md = '';
-  for (const { kind, obj } of items) {
+   Built as a list of blocks, each a bullet, a line or a paragraph, and then
+   joined: bullets follow bullets and lines follow lines directly; anything
+   else gets a blank line between, since a line straight after a bullet would
+   be read as part of that bullet. */
+function renderExport(data, settings) {
+  const opts = Object.assign({}, EXPORT_DEFAULTS, settings);
+  const marks = QUOTE_MARKS[opts.quoteMarks] || QUOTE_MARKS.double;
+  const blocks = [];
+
+  for (const { kind, obj } of annotationItems(data, 'position')) {
     if (kind === 'highlight') {
-      md += `- "${collapseWhitespace(obj.text || '')}"\n`;
-      if (obj.note && obj.note.trim()) {
-        for (const line of obj.note.split(/\r?\n/)) md += `\t- ${line}\n`;
+      const quote = collapseWhitespace(obj.text || '');
+      if (!quote) continue;
+      const shape = LAYOUT_SHAPES[opts.highlightLayout] || 'bullet';
+      const words = marks[0] + quote + marks[1];
+      const note = (obj.note || '').trim();
+      if (!note) {
+        blocks.push({ shape, text: words });
+      } else if (opts.noteLayout === 'same-line') {
+        blocks.push({ shape, text: `${words} ${note}` });
+      } else if (opts.noteLayout === 'line') {
+        blocks.push({ shape, text: `${words}\n${note}` });
+      } else if (opts.noteLayout === 'paragraph') {
+        blocks.push({ shape, text: words });
+        blocks.push({ shape: 'paragraph', text: note });
+      } else if (shape === 'bullet') {
+        /* Indented under the highlight's own bullet. */
+        blocks.push({ shape, text: words, children: [note] });
+      } else {
+        /* Nothing to indent under: a bullet of its own straight beneath. */
+        blocks.push({ shape, text: words });
+        blocks.push({ shape: 'bullet', text: note });
       }
     } else {
-      const lines = (obj.text || '').split(/\r?\n/);
-      md += lines.map((line, i) => (i === 0 ? `- ${line}` : `\t${line}`)).join('\n') + '\n';
+      const text = (obj.text || '').trim();
+      if (!text) continue;
+      blocks.push({ shape: LAYOUT_SHAPES[opts.looseNoteLayout] || 'bullet', text });
     }
   }
-  return md;
+
+  let md = '';
+  let previous = null;
+  for (const block of blocks) {
+    if (previous) md += previous.shape === block.shape && block.shape !== 'paragraph' ? '\n' : '\n\n';
+    md += formatBlock(block);
+    previous = block;
+  }
+  return md ? md + '\n' : '';
+}
+
+const EXPORT_DEFAULTS = {
+  quoteMarks: 'double',
+  highlightLayout: 'bullets',
+  noteLayout: 'indented-bullet',
+  looseNoteLayout: 'bullets',
+};
+
+const QUOTE_MARKS = {
+  single: ["'", "'"],
+  double: ['"', '"'],
+  none: ['', ''],
+};
+
+const LAYOUT_SHAPES = { bullets: 'bullet', lines: 'line', paragraphs: 'paragraph' };
+
+/* Every line is escaped: one starting with a quotation mark never needs it,
+   and any other could be someone's text that happens to look like markdown. */
+function formatBlock(block) {
+  const lines = block.text.split(/\r?\n/).map(escapeLineStart);
+  if (block.shape !== 'bullet') return lines.join('\n');
+  let out = `- ${lines[0]}`;
+  for (const line of lines.slice(1)) out += line ? `\n\t${line}` : '\n';
+  for (const child of block.children || []) {
+    const childLines = child.split(/\r?\n/).map(escapeLineStart);
+    out += `\n\t- ${childLines[0]}`;
+    for (const line of childLines.slice(1)) out += line ? `\n\t\t${line}` : '\n';
+  }
+  return out;
+}
+
+/* A line of someone's text that happens to start like markdown, "# 1" or
+   "- 5" or "1. Introduction" or "> said", would otherwise become a heading,
+   a list or a quote. A backslash only escapes punctuation, so a number keeps
+   its digits and has the full stop after it escaped instead. */
+function escapeLineStart(line) {
+  const numbered = /^(\d+)([.)])(\s|$)/.exec(line);
+  if (numbered) return `${numbered[1]}\\${line.slice(numbered[1].length)}`;
+  return /^(#{1,6}(\s|$)|[-+*](\s|$)|>)/.test(line) ? `\\${line}` : line;
 }
 
 /* A highlight's text arrives with the PDF's own line breaks in it, which are
@@ -2778,10 +2897,9 @@ module.exports = MinimalPdfAnnotatorPlugin;
 /**
  * @typedef {Object} DocState
  * @property {TFile} file                      the PDF
- * @property {{highlights: any[], notes: any[], markdownStamp: string | null}} data
+ * @property {{highlights: any[], notes: any[]}} data
  * @property {boolean} readOnly                the sidecar would not parse
  * @property {Promise<void>} saveChain         serialises writes to the sidecar
- * @property {boolean} markdownWarned
  * @property {string | null} sidecarStamp      what we last wrote, to tell our
  *                                             own saves from someone else's
  * @property {{highlights: any[], notes: any[]}} baseline

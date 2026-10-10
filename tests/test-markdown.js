@@ -1,9 +1,7 @@
-/* The generated markdown file, and the rule that decides whether the plugin is
-   allowed to write it.
-
-   That rule is the one piece of this plugin that can destroy something: the
-   transcript lives at "<name>.md" next to "<name>.pdf", which is also exactly
-   what a person taking notes on a PDF by hand would call their note. */
+/* Unit tests for Minimal PDF annotator's pure logic: page geometry, the
+   character model behind a selection, the note made from the annotations,
+   undo, the context menu, the sidebar's list and its search. Run with
+   `node tests/test-markdown.js`; Obsidian is stubbed. */
 const Module = require("module"), path = require("path"), fs = require("fs");
 
 const notices = [];
@@ -66,7 +64,7 @@ const P = path.join(__dirname, "..", "main.js");
 const m = new Module(P, null); m.filename = P; m.paths = Module._nodeModulePaths(path.dirname(P));
 m._compile(
   fs.readFileSync(P, "utf8") +
-    "\nmodule.exports.__t={renderMarkdown,collapseWhitespace,stamp,pct,pageNumberOf,uuid," +
+    "\nmodule.exports.__t={renderExport,escapeLineStart,collapseWhitespace,stamp,pct,pageNumberOf,uuid," +
     "firstRect,migrateHighlight,dropRunningHeads,unionRect,pagePaddingBox," +
     "measurable,cell,round,blank,charAt,describePoint,sameLine,boundaryPosition," +
     "indexOfBoundary,touchedBounds,refineBoundary,nearestPointer,isWordChar,insideWord," +
@@ -213,7 +211,7 @@ eq("a node with no parent does not", T.measurable({ nodeType: 3, parentElement: 
    array. The earlier design read the text from character offsets and the
    rectangles from the browser's selection geometry, which are two answers to
    the same question, and they disagreed by a glyph: a highlight would stretch
-   over a full stop the transcript left out, or the transcript would carry one
+   over a full stop the stored text left out, or the text would carry one
    the highlight did not cover. */
 
 const sharedNode = { nodeType: 3, nodeValue: "" };
@@ -418,7 +416,7 @@ console.log("\n--- selectedSlice");
   eq("with neither, the browser's answer stands", textOf(cs, noPointers.from, noPointers.to), "lonelines");
 }
 {
-  /* A pointer dragged past the full stop takes it, and the transcript and the
+  /* A pointer dragged past the full stop takes it, and the text and the
      rectangles then agree about it, because both are this one slice. */
   const node = { nodeType: 3, nodeValue: "episodes of loneliness." };
   const cs = chars([["episodes of loneliness.", 100, 500, node]]);
@@ -553,81 +551,74 @@ eq(
   { id: "x", text: "t", rects: [] }
 );
 
-/* ----------------------------------------------------------- the transcript */
+/* ------------------------------------------------- the note made on request */
 
-console.log("\n--- renderMarkdown");
+console.log("\n--- renderExport");
 
-eq("nothing to say produces nothing", T.renderMarkdown({ highlights: [], notes: [] }), "");
+const X = (data, settings) => T.renderExport(data, settings);
+const quoteWithNote = { highlights: [hl("quote", [r(1, 0)], { note: "my thought" })], notes: [] };
+const mixed = {
+  highlights: [hl("first", [r(1, 0.1)], { note: "on first" }), hl("second", [r(1, 0.3)])],
+  notes: [{ id: "n", page: 1, text: "loose", position: { y: 0.2 } }],
+};
 
-eq(
-  "a highlight becomes a quoted bullet",
-  T.renderMarkdown({ highlights: [hl("hello there", [r(1, 0.1)])], notes: [] }),
-  '- "hello there"\n'
-);
+eq("nothing to say produces nothing", X({ highlights: [], notes: [] }), "");
+eq("missing arrays are tolerated", X({}), "");
+eq("by default, a highlight is a bullet in double quotation marks", X({ highlights: [hl("hello there", [r(1, 0.1)])], notes: [] }), '- "hello there"\n');
+eq("a PDF's own line breaks inside a highlight are collapsed", X({ highlights: [hl("broken\nacross   lines", [r(1, 0)])], notes: [] }), '- "broken across lines"\n');
+eq("its note is a bullet indented under it", X(quoteWithNote), '- "quote"\n\t- my thought\n');
+eq("a note of several lines stays one bullet", X({ highlights: [hl("q", [r(1, 0)], { note: "one\ntwo" })], notes: [] }), '- "q"\n\t- one\n\t\ttwo\n');
+eq("a whitespace-only note is left out", X({ highlights: [hl("q", [r(1, 0)], { note: "   " })], notes: [] }), '- "q"\n');
+eq("a loose note is a bullet, in reading order", X(mixed), '- "first"\n\t- on first\n- loose\n- "second"\n');
+eq("a loose note of several lines continues indented", X({ highlights: [], notes: [{ page: 1, text: "one\ntwo", position: { y: 0.5 } }] }), "- one\n\ttwo\n");
+eq("an empty loose note is left out", X({ highlights: [], notes: [{ page: 1, text: " ", position: { y: 0.5 } }] }), "");
+eq("a highlight spanning two pages is placed by where it starts",
+  X({ highlights: [hl("later on page two", [r(2, 0.5)]), hl("across the break", [r(1, 0.9), r(2, 0.1)])], notes: [] }),
+  '- "across the break"\n- "later on page two"\n');
+eq("always in reading order, whatever the sidebar shows",
+  X({ highlights: [hl("lower", [r(1, 0.8)], { createdAt: "1" }), hl("upper", [r(1, 0.2)], { createdAt: "2" })], notes: [] }, { sidebarSort: "date" }),
+  '- "upper"\n- "lower"\n');
+eq("quotation marks inside a highlight are left as they are", X({ highlights: [hl('he said "hi"', [r(1, 0)])], notes: [] }), '- "he said "hi""\n');
 
-eq(
-  "a PDF's own line breaks inside a highlight are collapsed",
-  T.renderMarkdown({ highlights: [hl("broken\nacross   lines", [r(1, 0)])], notes: [] }),
-  '- "broken across lines"\n'
-);
+console.log("  quotation marks");
+eq("single", X(quoteWithNote, { quoteMarks: "single" }), "- 'quote'\n\t- my thought\n");
+eq("none", X(quoteWithNote, { quoteMarks: "none" }), "- quote\n\t- my thought\n");
+eq("something unknown falls back to double", X(quoteWithNote, { quoteMarks: "odd" }), '- "quote"\n\t- my thought\n');
 
-eq(
-  "a note on a highlight is indented under it",
-  T.renderMarkdown({ highlights: [hl("quote", [r(1, 0)], { note: "first\nsecond" })], notes: [] }),
-  '- "quote"\n\t- first\n\t- second\n'
-);
+console.log("  highlights as lines or paragraphs");
+const two = { highlights: [hl("one", [r(1, 0.1)]), hl("two", [r(1, 0.2)])], notes: [] };
+eq("lines follow each other directly", X(two, { highlightLayout: "lines" }), '"one"\n"two"\n');
+eq("paragraphs have a blank line between", X(two, { highlightLayout: "paragraphs" }), '"one"\n\n"two"\n');
 
-eq(
-  "a whitespace-only note on a highlight is left out",
-  T.renderMarkdown({ highlights: [hl("quote", [r(1, 0)], { note: "   " })], notes: [] }),
-  '- "quote"\n'
-);
+console.log("  notes on highlights");
+eq("on a new line", X(quoteWithNote, { noteLayout: "line" }), '- "quote"\n\tmy thought\n');
+eq("on a new line, under a line", X(quoteWithNote, { noteLayout: "line", highlightLayout: "lines" }), '"quote"\nmy thought\n');
+eq("in a new paragraph", X(quoteWithNote, { noteLayout: "paragraph", highlightLayout: "paragraphs" }), '"quote"\n\nmy thought\n');
+eq("in a new paragraph after a bullet, a blank line apart", X(quoteWithNote, { noteLayout: "paragraph" }), '- "quote"\n\nmy thought\n');
+eq("on the same line, after a space", X(quoteWithNote, { noteLayout: "same-line" }), '- "quote" my thought\n');
+eq("an indented bullet under a line has nothing to indent under, so is a plain bullet",
+  X(quoteWithNote, { highlightLayout: "lines" }), '"quote"\n\n- my thought\n');
+eq("and the next line after that bullet is set apart from it",
+  X({ highlights: [hl("a", [r(1, 0.1)], { note: "n" }), hl("b", [r(1, 0.2)])], notes: [] }, { highlightLayout: "lines" }),
+  '"a"\n\n- n\n\n"b"\n');
 
-eq(
-  "a standalone note is a plain bullet, continuation lines indented",
-  T.renderMarkdown({ highlights: [], notes: [{ page: 1, text: "one\ntwo", position: { y: 0.5 } }] }),
-  "- one\n\ttwo\n"
-);
+console.log("  loose notes");
+eq("as lines between bullets, set apart", X(mixed, { looseNoteLayout: "lines" }), '- "first"\n\t- on first\n\nloose\n\n- "second"\n');
+eq("as paragraphs", X(mixed, { looseNoteLayout: "paragraphs", highlightLayout: "paragraphs", noteLayout: "paragraph" }),
+  '"first"\n\non first\n\nloose\n\n"second"\n');
 
-eq(
-  "items come out in reading order: page, then down the page",
-  T.renderMarkdown({
-    highlights: [hl("second page", [r(2, 0.1)]), hl("lower", [r(1, 0.8)]), hl("upper", [r(1, 0.2)])],
-    notes: [{ page: 1, text: "middle", position: { y: 0.5 } }],
-  }),
-  '- "upper"\n- middle\n- "lower"\n- "second page"\n'
-);
-
-eq(
-  "a highlight spanning two pages is one bullet, placed by where it starts",
-  T.renderMarkdown({
-    highlights: [hl("later on page two", [r(2, 0.5)]), hl("across the break", [r(1, 0.9), r(2, 0.1)])],
-    notes: [],
-  }),
-  '- "across the break"\n- "later on page two"\n'
-);
-
-eq(
-  "a highlight with no rects still appears",
-  T.renderMarkdown({ highlights: [hl("orphan", [])], notes: [] }),
-  '- "orphan"\n'
-);
-
-eq("missing arrays are tolerated", T.renderMarkdown({}), "");
-
-/* Quotes in the highlighted text are left as they are rather than
-   backslash-escaped. Both forms render identically in markdown, so the escapes
-   only showed up as stray backslashes when reading the file as text. */
-eq(
-  "quotes inside a highlight are not escaped",
-  T.renderMarkdown({ highlights: [hl('he said "hi"', [r(1, 0)])], notes: [] }),
-  '- "he said "hi""\n'
-);
-eq(
-  "nor are backslashes",
-  T.renderMarkdown({ highlights: [hl("a\\b", [r(1, 0)])], notes: [] }),
-  '- "a\\b"\n'
-);
+console.log("  text that looks like markdown");
+eq("a bare highlight starting with # is not a heading", X({ highlights: [hl("# 1 Introduction", [r(1, 0)])], notes: [] }, { quoteMarks: "none", highlightLayout: "lines" }), "\\# 1 Introduction\n");
+eq("nor a numbered one a list, and keeps its number", X({ highlights: [hl("1. First", [r(1, 0)])], notes: [] }, { quoteMarks: "none" }), "- 1\\. First\n");
+eq("every line of a note is looked at, not just the first",
+  X({ highlights: [hl("q", [r(1, 0)], { note: "line one\n- item\n# head\n2. x" })], notes: [] }),
+  '- "q"\n\t- line one\n\t\t\\- item\n\t\t\\# head\n\t\t2\\. x\n');
+eq("a loose note is escaped even with quotation marks on",
+  X({ highlights: [hl("q", [r(1, 0)])], notes: [{ page: 1, text: "1. loose", position: { y: 0.5 } }] }, { looseNoteLayout: "lines" }),
+  '- "q"\n\n1\\. loose\n');
+eq("as is a note set in a paragraph of its own", X({ highlights: [hl("q", [r(1, 0)], { note: "# x" })], notes: [] }, { noteLayout: "paragraph" }), '- "q"\n\n\\# x\n');
+eq("a note starting with > is not a quote", X({ highlights: [], notes: [{ page: 1, text: "> aside", position: { y: 0 } }] }), "- \\> aside\n");
+eq("ordinary text is left alone", T.escapeLineStart("#hashtag and 1984"), "#hashtag and 1984");
 
 /* ------------------------------------------------------------- the stamp */
 
@@ -639,12 +630,12 @@ eq("a reordering is caught", T.stamp("ab") === T.stamp("ba"), false);
 eq("the empty string has a stamp", typeof T.stamp(""), "string");
 eq("length is part of it", T.stamp("a").split("-")[1], "1");
 
-/* --------------------------------------------- may we write that .md file? */
+/* ------------------------------------------------ making the note itself */
 
-console.log("\n--- writeMarkdown ownership");
+console.log("\n--- exportNote");
 
-/* A vault just big enough for writeMarkdown: files are TFile instances, so the
-   instanceof checks in the plugin behave as they do in Obsidian. */
+/* A vault just big enough: files are TFile instances, so the instanceof
+   checks in the plugin behave as they do in Obsidian. */
 function fakeVault(files) {
   const contents = new Map(Object.entries(files));
   const handles = new Map();
@@ -655,6 +646,8 @@ function fakeVault(files) {
   }
   return {
     log: [],
+    /* The disk ignores case, as on most Macs. */
+    adapter: { exists: async (p) => [...contents.keys()].some((k) => k.toLowerCase() === p.toLowerCase()) },
     getAbstractFileByPath(p) {
       return handles.get(p) || null;
     },
@@ -671,6 +664,7 @@ function fakeVault(files) {
       f.path = p;
       handles.set(p, f);
       contents.set(p, data);
+      return f;
     },
     read_(p) {
       return contents.get(p);
@@ -681,18 +675,19 @@ function fakeVault(files) {
 function harness(files, data) {
   const plugin = Object.create(PluginClass.prototype);
   const vault = fakeVault(files);
-  plugin.app = { vault };
-  plugin.settings = { highlightColor: "#ffeb3b", snapToWords: true };
+  const opened = [];
+  plugin.app = {
+    vault,
+    workspace: {
+      getLeaf: (kind) => ({ kind, async openFile(f) { opened.push([kind, f.path]); } }),
+      setActiveLeaf: (leaf, opts) => opened.push(["focus", !!(opts && opts.focus)]),
+    },
+  };
+  plugin.settings = Object.assign({}, { highlightColor: "#ffeb3b", snapToWords: true });
   const pdf = new TFile();
   pdf.path = "refs/paper.pdf";
-  const doc = {
-    file: pdf,
-    data: Object.assign({ highlights: [], notes: [], markdownStamp: null }, data),
-    readOnly: false,
-    markdownWarned: false,
-    saveChain: Promise.resolve(),
-  };
-  return { plugin, vault, doc };
+  const doc = { file: pdf, data: Object.assign({ highlights: [], notes: [] }, data), readOnly: false, saveChain: Promise.resolve() };
+  return { plugin, vault, doc, opened };
 }
 
 const ONE = { highlights: [hl("quote one", [r(1, 0)])], notes: [] };
@@ -700,86 +695,46 @@ const ONE_MD = '- "quote one"\n';
 
 (async () => {
   {
-    const { plugin, vault, doc } = harness({}, ONE);
+    const { plugin, vault, doc, opened } = harness({}, ONE);
     notices.length = 0;
-    await plugin.writeMarkdown(doc);
-    eq("no file there yet: one is created", vault.log, [["create", "refs/paper.md"]]);
-    eq("with the transcript in it", vault.read_("refs/paper.md"), ONE_MD);
-    eq("and the stamp recorded", doc.data.markdownStamp, T.stamp(ONE_MD));
-    /* A file has appeared in the vault that was not there before, and where it
-       appeared is not obvious, so this one is worth saying out loud. */
-    eq("and the new file is announced, by its path", notices, ["Created refs/paper.md"]);
+    await plugin.exportNote(doc);
+    eq("a note named after the PDF is made beside it", vault.log, [["create", "refs/paper.md"]]);
+    eq("holding the annotations", vault.read_("refs/paper.md"), ONE_MD);
+    eq("opened in a new tab, with the cursor in it", opened, [["tab", "refs/paper.md"], ["focus", true]]);
+    eq("and announced by its path", notices, ["Created refs/paper.md"]);
   }
-
+  {
+    const mine = "# Paper\n\nMy own notes on this paper.\n";
+    const { plugin, vault, doc } = harness({ "refs/paper.md": mine, "refs/paper 1.md": "also mine" }, ONE);
+    await plugin.exportNote(doc);
+    eq("a name already taken is never written over", vault.log, [["create", "refs/paper 2.md"]]);
+    eq("what was there survives", [vault.read_("refs/paper.md"), vault.read_("refs/paper 1.md")], [mine, "also mine"]);
+  }
+  {
+    const { plugin, vault, doc } = harness({ "refs/Paper.md": "mine" }, ONE);
+    await plugin.exportNote(doc);
+    eq("a name taken in another case counts as taken", vault.log, [["create", "refs/paper 1.md"]]);
+  }
   {
     const { plugin, vault, doc } = harness({}, { highlights: [], notes: [] });
-    await plugin.writeMarkdown(doc);
-    eq("nothing to write means no file is created", vault.log, []);
-  }
-
-  {
-    /* The ordinary case: we wrote it last time, a highlight has been added. */
-    const { plugin, vault, doc } = harness({ "refs/paper.md": ONE_MD }, {
-      highlights: [hl("quote one", [r(1, 0)]), hl("quote two", [r(1, 0.5)])],
-      notes: [],
-      markdownStamp: T.stamp(ONE_MD),
-    });
     notices.length = 0;
-    await plugin.writeMarkdown(doc);
-    eq("a file we wrote is updated", vault.log, [["modify", "refs/paper.md"]]);
-    eq("to the new transcript", vault.read_("refs/paper.md"), '- "quote one"\n- "quote two"\n');
-    eq("quietly, since it is not news", notices.length, 0);
+    await plugin.exportNote(doc);
+    eq("nothing to put in it makes no note", vault.log, []);
+    eq("and says so", notices.length, 1);
   }
-
   {
-    /* The dangerous case: someone's own note is sitting at that path. */
-    const mine = "# Paper\n\nMy own notes on this paper, which took a while.\n";
-    const { plugin, vault, doc } = harness({ "refs/paper.md": mine }, ONE);
-    notices.length = 0;
-    await plugin.writeMarkdown(doc);
-    eq("a file we did not write is left alone", vault.log, []);
-    eq("its contents survive untouched", vault.read_("refs/paper.md"), mine);
-    eq("and the person is told once", notices.length, 1);
-    eq("by a message naming the file", notices[0].includes("refs/paper.md"), true);
-
-    await plugin.writeMarkdown(doc);
-    eq("still left alone on the next save", vault.log, []);
-    eq("and not told twice", notices.length, 1);
+    const { plugin, vault, doc } = harness({}, ONE);
+    plugin.settings.quoteMarks = "single";
+    await plugin.exportNote(doc);
+    eq("the layout settings are followed", vault.read_("refs/paper.md"), "- 'quote one'\n");
   }
-
   {
-    /* Edited by hand after we generated it: the edit is somebody's work too. */
-    const edited = ONE_MD + "\nand a thought of my own\n";
-    const { plugin, vault, doc } = harness({ "refs/paper.md": edited }, {
-      highlights: [hl("quote one", [r(1, 0)])],
-      notes: [],
-      markdownStamp: T.stamp(ONE_MD),
-    });
-    await plugin.writeMarkdown(doc);
-    eq("an edited transcript is left alone", vault.log, []);
-    eq("with the edit intact", vault.read_("refs/paper.md"), edited);
-  }
-
-  {
-    /* Generated before stamps were recorded, and still in sync: adopt it,
-       so upgrading does not strand the file. */
-    const { plugin, vault, doc } = harness({ "refs/paper.md": ONE_MD }, ONE);
-    notices.length = 0;
-    await plugin.writeMarkdown(doc);
-    eq("an unstamped file already in sync is adopted", notices.length, 0);
-    eq("nothing needed writing", vault.log, []);
-    eq("and it is stamped from now on", doc.data.markdownStamp, T.stamp(ONE_MD));
-  }
-
-  {
-    /* No redundant writes: Obsidian would log a file change for each one. */
-    const { plugin, vault, doc } = harness({ "refs/paper.md": ONE_MD }, {
-      highlights: ONE.highlights,
-      notes: [],
-      markdownStamp: T.stamp(ONE_MD),
-    });
-    await plugin.writeMarkdown(doc);
-    eq("an unchanged transcript is not rewritten", vault.log, []);
+    /* Saving annotations no longer writes any markdown. */
+    const { plugin, vault, doc } = harness({}, ONE);
+    plugin.getSidecarPath = () => "refs/paper.annotations.json";
+    await plugin.save(doc);
+    eq("saving writes only the annotations file", vault.log, [["create", "refs/paper.annotations.json"]]);
+    eq("which holds only the annotations", Object.keys(JSON.parse(vault.read_("refs/paper.annotations.json"))), ["highlights", "notes"]);
   }
 
   /* ------------------------------------------------------- small helpers */
@@ -803,8 +758,7 @@ const ONE_MD = '- "quote one"\n';
    The history holds whole copies of the annotations rather than descriptions
    of what changed, so a restore puts back a known-good state instead of
    trying to invert an operation. These check that it does, that a redo is
-   discarded as soon as something new happens, and that the marker recording
-   ownership of the generated markdown file is never restored along with it. */
+   discarded as soon as something new happens. */
 console.log("\n--- undo and redo");
 
 function undoHarness() {
@@ -827,10 +781,9 @@ function undoHarness() {
   pdf.path = "refs/paper.pdf";
   const doc = {
     file: pdf,
-    data: { highlights: [], notes: [], markdownStamp: "original" },
+    data: { highlights: [], notes: [] },
     readOnly: false,
     saveChain: Promise.resolve(),
-    markdownWarned: false,
     sidecarStamp: null,
     baseline: T.snapshot({ highlights: [], notes: [] }),
     undoStack: [],
@@ -842,11 +795,11 @@ const titles = (doc) => doc.data.highlights.map((h) => h.text);
 
 console.log("  snapshot");
 {
-  const data = { highlights: [hl("one", [r(1, 0)])], notes: [], markdownStamp: "keep" };
+  const data = { highlights: [hl("one", [r(1, 0)])], notes: [], extra: "not an annotation" };
   const copy = T.snapshot(data);
   data.highlights[0].text = "changed";
   eq("a snapshot is a copy, not a reference", copy.highlights[0].text, "one");
-  eq("the ownership marker is left out of it", "markdownStamp" in copy, false);
+  eq("only the annotations are copied", Object.keys(copy), ["highlights", "notes"]);
   eq("missing arrays become empty ones", T.snapshot({}), { highlights: [], notes: [] });
 }
 
@@ -917,10 +870,8 @@ console.log("  what it does not disturb");
   const { plugin, doc } = undoHarness();
   doc.data.highlights.push(hl("one", [r(1, 0)]));
   plugin.commit(doc, "adding a highlight");
-  doc.data.markdownStamp = "written-since";
   plugin.undo(doc);
-  eq("undoing leaves the ownership marker alone", doc.data.markdownStamp, "written-since");
-  eq("and saves the result", plugin.saved > 0, true);
+  eq("undoing saves the result", plugin.saved > 0, true);
   eq("and the sidebar is told", plugin.notified > 0, true);
   plugin.views.set("v", { view: "v", container: {}, doc });
   plugin.renders = 0;
@@ -1394,7 +1345,7 @@ function drawn(data, pages) {
 console.log("\n--- what the right-click menu offers");
 
 /* Right-clicking highlighted text used to make a standalone note anchored at
-   that point. In the transcript a standalone note is a bullet of its own, so
+   that point. In the exported note a standalone note is a bullet of its own, so
    it had nothing to sit under, which is how it was reported: "the note does
    not indent". A note asked for on top of a highlight is now that highlight's
    note. */
@@ -1501,7 +1452,7 @@ const page = {};
    where a standalone note is a bullet of its own. */
 eq(
   "a note on a highlight indents under it",
-  T.renderMarkdown({
+  T.renderExport({
     highlights: [hl("quoted", [r(1, 0)], { note: "a thought" })],
     notes: [],
   }),
