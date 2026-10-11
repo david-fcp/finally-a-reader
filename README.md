@@ -24,8 +24,14 @@ While highlight mode is on, text being selected shows in the highlight colour.
 
 With highlight mode off, selecting text brings up a small bar of icons beside
 it, as in Zotero: **Highlight**, **Add note** (highlights it and puts the
-cursor in its note) and **Copy**. It goes away when you click elsewhere, scroll or type.
-Right-clicking selected text offers Highlight too.
+cursor in its note) and **Copy**. It goes away when you click elsewhere,
+scroll or type.
+
+Right-clicking in a document brings up the same kind of bar, with what fits
+where you clicked: on selected text, Highlight, Add note and Copy; on a
+highlight, its note, Copy and Remove; on plain text, Add note. On a Mac it
+also offers **Look up**, which shows the word's dictionary entry; a setting
+turns that off. Hover over an icon to see its name.
 
 PDFs and books look the same: the top of the tab holds the highlighter and
 the zoom buttons, and nothing else. Zooming a book works as it does a PDF:
@@ -43,8 +49,8 @@ The sidebar opens by itself the first time you open a PDF or EPUB. The command
 - **Click a highlight in the document** to land in its note box in the
   sidebar.
 - **Click a highlight's words in the sidebar** to go to it in the document.
-- **Right-click a bare part of the text** for "Add note", which makes a note of
-  its own at that point.
+- **Right-click plain text** for "Add note", which makes a note of its own at
+  that point.
 - **Delete** a highlight or note with the trash can on its card, by
   right-clicking the card, or by selecting the card and pressing Delete. Right-clicking a
   highlight in the document offers the same.
@@ -65,7 +71,10 @@ belongs to, so it never covers the text.
   appear in the document and the order you added them.
 - **A highlight longer than five lines** is cut short, fading out. Click it
   once to read the whole thing and again to go to it. "Show less" cuts it
-  short again.
+  short again. A note longer than five lines is cut short in the same way
+  whenever you're not typing in it.
+- **The card you're working with** has a bold outline, which goes when you
+  click anywhere else.
 - **The note button** makes a markdown note (see below).
 
 ### Making a note
@@ -90,6 +99,9 @@ when you want an updated copy.
 EPUBs open in the plugin's own reader, as one continuous scroll through the
 whole book. Everything above works in them as it does in PDFs. The book uses
 your theme's colours and font unless it sets its own.
+A chapter heading that only links back to the table of contents, as many
+ebook tools make them, is shown as plain text, so clicking it doesn't take
+you away from the chapter.
 
 Books with DRM, and fixed-layout books such as picture books and magazines,
 can't be opened; the reader says so. Nothing in a book can run: it is shown
@@ -111,6 +123,8 @@ in a sandbox with scripts switched off.
   paragraph under it, or on the same line as it.
 - **Notes that aren't attached to highlighted text appear in the .md file as**
   new bullets, new lines or new paragraphs.
+- **Look up in the right-click menu** (Mac only). Adds a button that shows the
+  dictionary entry for the word you right-click.
 - **Remember each PDF's zoom level.** Each PDF reopens at the zoom you last
   read it at. This is kept per device, since a comfortable zoom depends on the
   screen in front of you.

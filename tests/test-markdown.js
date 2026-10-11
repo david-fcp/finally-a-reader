@@ -1408,7 +1408,8 @@ function menuFor(hit) {
   };
   plugin.addStandaloneNote = () => plugin.calls.push(["new standalone note"]);
   plugin.commit = () => {};
-  plugin.selectionBar = { hide() {} };
+  let shown = null;
+  plugin.selectionBar = { hide() {}, show(anchor, buttons) { shown = buttons; } };
   plugin.addHighlightsFromSelection = () => {
     plugin.calls.push(["highlight the selection"]);
     return "new";
@@ -1422,12 +1423,28 @@ function menuFor(hit) {
   } finally {
     global.window = before;
   }
-  return { plugin, menu: MenuStub.last };
+  /* The right-click bar, read as a menu: its buttons, by name. */
+  return { plugin, menu: { items: (shown || []).map((x) => ({ title: x.label, icon: x.icon, click: x.run })) } };
 }
 const icon = (kind, id) => ({ dataset: { noteKind: kind, noteId: id } });
 const rectEl = (id) => ({ dataset: { highlightId: id } });
 const docWith = (data) => ({ data, readOnly: false });
 const page = {};
+
+{
+  /* Copy, for highlighted text: the highlight's own words. */
+  const doc = docWith({ highlights: [hl("the words", [r(1, 0.5)])], notes: [] });
+  doc.data.highlights[0].id = "h1";
+  const { plugin, menu } = menuFor({ state: { doc }, pageEl: page, highlightEl: rectEl("h1"), noteIconEl: null });
+  eq("a highlight offers its note, copying, and removal, as icons", menu.items.map((i) => i.icon), ["sticky-note", "copy", "trash-2"]);
+  let copied = null;
+  plugin.copyText = (t) => (copied = t);
+  menu.items.find((i) => i.title === "Copy").click();
+  eq("copying copies the highlighted words", copied, "the words");
+  doc.readOnly = true;
+  const readOnly = menuFor({ state: { doc }, pageEl: page, highlightEl: rectEl("h1"), noteIconEl: null }).menu;
+  eq("in a read-only document, copying is still offered, and nothing else", readOnly.items.map((i) => i.title), ["Copy"]);
+}
 
 {
   /* Text selected in the PDF, with highlight mode off. */
@@ -1442,7 +1459,7 @@ const page = {};
     selection,
   });
   eq("a selection is offered for highlighting first", menu.items[0].title, "Highlight");
-  eq("then copying", menu.items[1].title, "Copy");
+  eq("then noting and copying, as the selection bar does", [menu.items[1].title, menu.items[2].title], ["Add note", "Copy"]);
   menu.items[0].click();
   eq("and highlighting it highlights it", plugin.calls, [["highlight the selection"]]);
 }

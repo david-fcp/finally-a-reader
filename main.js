@@ -19,7 +19,6 @@ const {
   Plugin,
   PluginSettingTab,
   Setting,
-  Menu,
   Notice,
   TFile,
   Platform,
@@ -41,6 +40,8 @@ const DEFAULT_SETTINGS = {
   highlightLayout: 'bullets',
   noteLayout: 'indented-bullet',
   looseNoteLayout: 'bullets',
+  /* macOS only: Look Up in the right-click menu. */
+  lookUp: true,
 };
 
 const HEX_COLOR_RE = /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
@@ -218,6 +219,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     this.registerDomEvent(doc, 'mousedown', (e) => {
       if (!this.selectionBar.contains(e.target)) this.selectionBar.hide();
       this.footnotes.pressed(e);
+      for (const sidebar of this.sidebars()) sidebar.pressedElsewhere(e);
     }, true);
     this.registerDomEvent(doc, 'wheel', () => {
       this.selectionBar.hide();
@@ -818,6 +820,46 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     }, 0);
   }
 
+  /* macOS's Look Up, which shows a word's dictionary entry, as a button for a
+     right-click: on the selection if the click was on it, otherwise on the
+     word under the pointer. Off where the setting is off, or not a Mac. */
+  lookUpButton(win, e, onSelection) {
+    if (!Platform.isMacOS || !this.settings || !this.settings.lookUp) return null;
+    const range = onSelection ? null : wordRangeAt(win.document, e.clientX, e.clientY);
+    if (!onSelection && !range) return null;
+    return {
+      icon: 'book-a',
+      label: 'Look up',
+      run: () => {
+        if (range) {
+          const selection = win.getSelection();
+          selection.removeAllRanges();
+          selection.addRange(range);
+        }
+        this.lookUp(win);
+      },
+    };
+  }
+
+  lookUp(win) {
+    try {
+      win.focus();
+    } catch (err) {
+      /* A frame that cannot take the focus still has its selection. */
+    }
+    /* After the focus has moved, so it is the window with the word that
+       shows the dictionary. */
+    window.setTimeout(() => {
+      try {
+        const remote = window.require('@electron/remote');
+        const contents = remote.webContents.getFocusedWebContents() || (win === window ? remote.getCurrentWebContents() : null);
+        if (contents) contents.showDefinitionForSelection();
+      } catch (err) {
+        this.report('could not look the word up', err);
+      }
+    }, 0);
+  }
+
   /* What the selection bar and the right-click menu do with a selection, for
      either kind of document: `make` turns the selection into a highlight and
      returns its id. */
@@ -863,7 +905,6 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
   onContextMenu(e) {
     const hit = this.locate(e);
     if (!hit || !hit.pageEl) return; // only intercept a right-click on a page
-    if (hit.state.doc.readOnly) return; // leave the viewer's own menu in place
 
     const { state, pageEl, noteIconEl } = hit;
     const iconKind = noteIconEl ? noteIconEl.dataset.noteKind : null;
@@ -874,88 +915,60 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     let highlightId = hit.highlightEl ? hit.highlightEl.dataset.highlightId : null;
     if (!highlightId && iconKind === 'highlight') highlightId = iconId;
 
-    const menu = new Menu();
+    const doc = state.doc;
     this.selectionBar.hide();
+    const buttons = [];
+    const add = (icon, label, run) => buttons.push({ icon, label, run });
 
-    /* Text selected in this document: offer to highlight it. */
-    const selection = windowOf(state.container).getSelection();
-    if (
-      selection &&
+    /* Right-clicking the selection: what the selection bar offers. */
+    const win = windowOf(state.container);
+    const selection = win.getSelection();
+    const onSelection =
+      !!selection &&
       !selection.isCollapsed &&
-      selection.rangeCount &&
+      !!selection.rangeCount &&
       state.container.contains(selection.getRangeAt(0).commonAncestorContainer) &&
-      pointInRange(selection.getRangeAt(0), e.clientX, e.clientY)
-    ) {
-      const act = this.selectionActions(state.doc, () => this.addHighlightsFromSelection(state), () => selection.toString());
-      menu.addItem((item) => item.setTitle('Highlight').setIcon('highlighter').onClick(act.highlight));
-      menu.addItem((item) => item.setTitle('Copy').setIcon('copy').onClick(act.copy));
-      menu.addSeparator();
-    }
-
-    /* A note asked for on top of a highlight belongs to that highlight, not to
-       the point on the page. Making a standalone note there instead left it
-       with nothing to sit under in an exported note, and gave the highlight two
-       separate things attached to the same words. */
-    if (iconKind === 'note') {
-      menu.addItem((item) =>
-        item
-          .setTitle('Edit note')
-          .setIcon('sticky-note')
-          .onClick(() => this.revealAnnotation(state.doc, iconId, true))
-      );
-    } else if (highlightId) {
-      const existing = state.doc.data.highlights.find((h) => h.id === highlightId);
-      menu.addItem((item) =>
-        item
-          .setTitle(existing && existing.note ? 'Edit note' : 'Add note')
-          .setIcon('sticky-note')
-          .onClick(() => this.revealAnnotation(state.doc, highlightId, true))
-      );
-    } else {
-      menu.addItem((item) =>
-        item
-          .setTitle('Add note')
-          .setIcon('sticky-note')
-          .onClick(() => this.addStandaloneNote(state, e, pageEl))
-      );
-    }
-
-    if (iconKind === 'note') {
-      menu.addItem((item) =>
-        item
-          .setTitle('Remove note')
-          .setIcon('trash')
-          .onClick(() => {
-            state.doc.data.notes = state.doc.data.notes.filter((n) => n.id !== iconId);
-            this.commit(state.doc, 'removing a note');
-          })
-      );
-    } else if (highlightId) {
-      const highlight = state.doc.data.highlights.find((h) => h.id === highlightId);
-      if (highlight && highlight.note) {
-        menu.addItem((item) =>
-          item
-            .setTitle('Remove note')
-            .setIcon('trash')
-            .onClick(() => {
-              highlight.note = '';
-              this.commit(state.doc, 'removing a note');
-            })
-        );
+      pointInRange(selection.getRangeAt(0), e.clientX, e.clientY);
+    if (onSelection) {
+      buttons.push(...selectionButtons(this.selectionActions(doc, () => this.addHighlightsFromSelection(state), () => selection.toString())));
+    } else if (iconKind === 'note') {
+      /* A note of its own, by its marker. */
+      if (!doc.readOnly) {
+        add('sticky-note', 'Edit note', () => this.revealAnnotation(doc, iconId, true));
+        add('eraser', 'Remove note', () => this.deleteAnnotation(doc, iconId));
       }
-      menu.addItem((item) =>
-        item
-          .setTitle('Remove highlight')
-          .setIcon('trash')
-          .onClick(() => {
-            state.doc.data.highlights = state.doc.data.highlights.filter((h) => h.id !== highlightId);
-            this.commit(state.doc, 'removing a highlight');
-          })
-      );
+    } else if (highlightId) {
+      /* A note asked for on top of a highlight belongs to that highlight, not
+         to the point on the page: a note of its own there would have nothing
+         to sit under in an exported note. */
+      const highlight = doc.data.highlights.find((h) => h.id === highlightId);
+      if (!doc.readOnly) {
+        add('sticky-note', highlight && highlight.note ? 'Edit note' : 'Add note', () => this.revealAnnotation(doc, highlightId, true));
+      }
+      if (highlight) add('copy', 'Copy', () => this.copyText(highlight.text || ''));
+      if (!doc.readOnly) {
+        if (highlight && highlight.note) {
+          add('eraser', 'Remove note', () => {
+            highlight.note = '';
+            this.commit(doc, 'removing a note');
+          });
+        }
+        add('trash-2', 'Remove highlight', () => this.deleteAnnotation(doc, highlightId));
+      }
+    } else if (!doc.readOnly) {
+      add('sticky-note', 'Add note', () => this.addStandaloneNote(state, e, pageEl));
     }
+    const look = this.lookUpButton(win, e, onSelection);
+    if (look) buttons.push(look);
 
+    /* Nothing of ours to offer: the viewer's own menu is left in place. */
+    if (!buttons.length) return;
     e.preventDefault();
-    menu.showAtMouseEvent(e);
+    this.selectionBar.show({ left: e.clientX, right: e.clientX, top: e.clientY, bottom: e.clientY }, buttons, state.container && state.container.ownerDocument);
+  }
+
+  copyText(text) {
+    navigator.clipboard.writeText(text).catch((err) => this.report('could not copy', err));
   }
 
   /* Persist a change and redraw every view showing that PDF.
@@ -1580,6 +1593,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     }
     this.settings.snapToWords = this.settings.snapToWords !== false;
     this.settings.rememberZoom = this.settings.rememberZoom !== false;
+    this.settings.lookUp = this.settings.lookUp !== false;
     const valid = {
       quoteMarks: Object.keys(QUOTE_MARKS),
       highlightLayout: Object.keys(LAYOUT_SHAPES),
@@ -1679,6 +1693,13 @@ class MinimalPdfAnnotatorSettingTab extends PluginSettingTab {
       lines: 'new lines',
       paragraphs: 'new paragraphs',
     });
+
+    if (Platform.isMacOS) {
+      new Setting(containerEl)
+        .setName('Look up in the right-click menu')
+        .setDesc('Adds a button that shows the dictionary entry for the word you right-click, using your Mac\u2019s Look Up.')
+        .addToggle((toggle) => toggle.setValue(settings.lookUp).onChange((v) => save('lookUp', v)));
+    }
 
     new Setting(containerEl)
       .setName('Remember each PDF\u2019s zoom level')
@@ -2228,9 +2249,6 @@ class EpubView extends FileView {
     d.addEventListener('mousedown', (e) => {
       plugin.selectionBar.hide();
       this.pressedAt = { x: e.clientX, y: e.clientY };
-      /* A click in the book never reaches Obsidian's window, where an open
-         menu listens for a click outside it, so the book closes it itself. */
-      if (this.menu) this.menu.hide();
       plugin.recentView = this;
       /* Clicking into the book makes it the document in front, as clicking
          into a PDF does: the sidebar follows. */
@@ -2330,68 +2348,51 @@ class EpubView extends FileView {
     e.preventDefault();
     const plugin = this.plugin;
     const doc = state.doc;
-    const menu = new Menu();
-    let items = 0;
-    const add = (build) => {
-      items++;
-      menu.addItem(build);
-    };
-    const selection = this.frame.contentWindow.getSelection();
+    const buttons = [];
+    const add = (icon, label, run) => buttons.push({ icon, label, run });
+    const win = this.frame.contentWindow;
+    const selection = win.getSelection();
     /* Only when the right-click is on the selection itself. */
-    const selected =
-      selection && !selection.isCollapsed && selection.rangeCount && pointInRange(selection.getRangeAt(0), e.clientX, e.clientY)
-        ? selection.toString()
-        : '';
+    const onSelection =
+      !!selection && !selection.isCollapsed && !!selection.rangeCount && pointInRange(selection.getRangeAt(0), e.clientX, e.clientY);
     plugin.selectionBar.hide();
-    if (selected) {
-      const act = plugin.selectionActions(doc, () => this.highlightSelection(doc), () => selected);
-      if (act.highlight) add((item) => item.setTitle('Highlight').setIcon('highlighter').onClick(act.highlight));
-      add((item) => item.setTitle('Copy').setIcon('copy').onClick(act.copy));
-    }
-    const hit = this.hitAt(e.clientX, e.clientY);
-    if (!doc.readOnly) {
-      if (hit && hit.kind === 'note') {
-        add((item) => item.setTitle('Edit note').setIcon('sticky-note').onClick(() => plugin.revealAnnotation(doc, hit.id, true)));
-        add((item) => item.setTitle('Remove note').setIcon('trash').onClick(() => plugin.deleteAnnotation(doc, hit.id)));
-      } else if (hit) {
-        const found = findAnnotation(doc.data, hit.id);
-        const hasNote = !!(found && found.obj.note);
-        add((item) =>
-          item
-            .setTitle(hasNote ? 'Edit note' : 'Add note')
-            .setIcon('sticky-note')
-            .onClick(() => plugin.revealAnnotation(doc, hit.id, true))
-        );
-        if (hasNote) {
-          add((item) =>
-            item
-              .setTitle('Remove note')
-              .setIcon('trash')
-              .onClick(() => {
-                const current = findAnnotation(doc.data, hit.id);
-                if (!current) return;
-                current.obj.note = '';
-                plugin.commit(doc, 'removing a note');
-              })
-          );
-        }
-        add((item) => item.setTitle('Remove highlight').setIcon('trash').onClick(() => plugin.deleteAnnotation(doc, hit.id)));
-      } else {
-        const caret = caretRangeAt(this.frame.contentDocument, e.clientX, e.clientY);
-        const position = caret && this.positionOf(caret.startContainer, caret.startOffset);
-        if (position) {
-          add((item) => item.setTitle('Add note').setIcon('sticky-note').onClick(() => this.addNoteAt(doc, position)));
-        }
+    const hit = onSelection ? null : this.hitAt(e.clientX, e.clientY);
+    if (onSelection) {
+      const text = selection.toString();
+      buttons.push(...selectionButtons(plugin.selectionActions(doc, () => this.highlightSelection(doc), () => text)));
+    } else if (hit && hit.kind === 'note') {
+      if (!doc.readOnly) {
+        add('sticky-note', 'Edit note', () => plugin.revealAnnotation(doc, hit.id, true));
+        add('eraser', 'Remove note', () => plugin.deleteAnnotation(doc, hit.id));
       }
+    } else if (hit) {
+      const found = findAnnotation(doc.data, hit.id);
+      const hasNote = !!(found && found.obj.note);
+      if (!doc.readOnly) add('sticky-note', hasNote ? 'Edit note' : 'Add note', () => plugin.revealAnnotation(doc, hit.id, true));
+      if (found) add('copy', 'Copy', () => plugin.copyText(found.obj.text || ''));
+      if (!doc.readOnly) {
+        if (hasNote) {
+          add('eraser', 'Remove note', () => {
+            const current = findAnnotation(doc.data, hit.id);
+            if (!current) return;
+            current.obj.note = '';
+            plugin.commit(doc, 'removing a note');
+          });
+        }
+        add('trash-2', 'Remove highlight', () => plugin.deleteAnnotation(doc, hit.id));
+      }
+    } else if (!doc.readOnly) {
+      const caret = caretRangeAt(this.frame.contentDocument, e.clientX, e.clientY);
+      const position = caret && this.positionOf(caret.startContainer, caret.startOffset);
+      if (position) add('sticky-note', 'Add note', () => this.addNoteAt(doc, position));
     }
-    if (items) {
-      const frameBox = this.frame.getBoundingClientRect();
-      menu.showAtPosition({ x: frameBox.left + e.clientX, y: frameBox.top + e.clientY });
-      this.menu = menu;
-      menu.onHide(() => {
-        if (this.menu === menu) this.menu = null;
-      });
-    }
+    const look = plugin.lookUpButton(win, e, onSelection);
+    if (look) buttons.push(look);
+    if (!buttons.length) return;
+    const frameBox = this.frame.getBoundingClientRect();
+    const x = frameBox.left + e.clientX;
+    const y = frameBox.top + e.clientY;
+    plugin.selectionBar.show({ left: x, right: x, top: y, bottom: y }, buttons, this.containerEl.ownerDocument);
   }
 
   /* Highlight mode off: a selection in the book gets the small bar. */
@@ -2883,6 +2884,7 @@ async function readBook(buffer, blobs) {
     sections.push({ body, bodyClass: body.getAttribute && body.getAttribute('class') });
   }
 
+  dropHeadingBackLinks(sections.map((section) => section.body));
   const roots = (users) => Array.from(users, (i) => `#mpa${i}`).join(', ');
   const inlineStyles = Array.from(inline, ([css, users]) => scopeCss(css, roots(users)));
   const styles = [];
@@ -3056,6 +3058,47 @@ function splitTopLevel(text, at, keep) {
   if (separator && keep) out.push(separator);
   if (piece) out.push(piece);
   return keep ? out : out.map((p) => p);
+}
+
+/* A chapter heading made into a link back to its table-of-contents entry,
+   as Calibre and others make them, would take the reader away from the
+   chapter they have just arrived at. Such a link is dropped and its words
+   kept: a link in a heading whose target links straight back to that
+   heading. Other links in headings are left alone. */
+function dropHeadingBackLinks(bodies) {
+  const HEADINGS = 'h1, h2, h3, h4, h5, h6';
+  for (const [i, body] of bodies.entries()) {
+    if (!body || !body.querySelectorAll) continue;
+    for (const link of Array.from(body.querySelectorAll('h1 a[href], h2 a[href], h3 a[href], h4 a[href], h5 a[href], h6 a[href]'))) {
+      const m = /^#mpa(\d+)$/.exec(link.getAttribute('href') || '');
+      const fragment = link.getAttribute('data-mpa-fragment');
+      const other = m && bodies[Number(m[1])];
+      if (!other || !fragment) continue;
+      const esc = CSS.escape(fragment);
+      const target = other.querySelector(`[id="${esc}"]`) || other.querySelector(`a[name="${esc}"]`);
+      if (!target) continue;
+      const heading = link.closest(HEADINGS);
+      /* The link is the heading's title, all of it: a footnote marker in a
+         heading is a link too, and its note links back to it. */
+      if (collapseWhitespace(link.textContent) !== collapseWhitespace(heading.textContent)) continue;
+      /* The heading's own name, not that of anything inside the link. */
+      const ids = new Set(
+        [heading, ...heading.querySelectorAll('[id], a[name]')]
+          .filter((el) => el === heading || !link.contains(el) || el === link)
+          .filter((el) => !(el.matches('a[href]') && el !== link))
+          .map((el) => el.getAttribute('id') || el.getAttribute('name'))
+          .filter(Boolean)
+      );
+      const area = target.matches('a[href]') ? target : target.closest('li, p') || target;
+      const links = [...(area.matches('a[href]') ? [area] : []), ...area.querySelectorAll('a[href]')];
+      const back = links.some(
+        (a) => a.getAttribute('href') === `#mpa${i}` && ids.has(a.getAttribute('data-mpa-fragment') || '')
+      );
+      if (!back) continue;
+      while (link.firstChild) link.parentNode.insertBefore(link.firstChild, link);
+      link.remove();
+    }
+  }
 }
 
 function revokeBook(book) {
@@ -3320,8 +3363,11 @@ class SelectionBar {
     this.el = null;
   }
 
-  /* anchor: the selection's last line, in the window's coordinates. */
-  show(anchor, actions, doc) {
+  /* anchor: where the bar belongs, in the window's coordinates: a
+     selection's last line, or the point right-clicked. buttons: a list of
+     { icon, label, run }, or the actions of a selection. */
+  show(anchor, buttons, doc) {
+    const list = Array.isArray(buttons) ? buttons : selectionButtons(buttons);
     this.hide();
     const home = doc || document;
     const win = home.defaultView || window;
@@ -3340,9 +3386,7 @@ class SelectionBar {
         }
       });
     };
-    if (actions.highlight) button('highlighter', 'Highlight', actions.highlight);
-    if (actions.note) button('sticky-note', 'Add note', actions.note);
-    button('copy', 'Copy', actions.copy);
+    for (const b of list) button(b.icon, b.label, b.run);
     const at = placeBox(
       { left: anchor.right - el.offsetWidth / 2, top: anchor.top, bottom: anchor.bottom },
       { width: el.offsetWidth, height: el.offsetHeight },
@@ -3386,6 +3430,67 @@ function pointInRange(range, x, y) {
   return Array.from(range.getClientRects()).some(
     (r) => r.width > 0 && x >= r.left - slack && x <= r.right + slack && y >= r.top - slack && y <= r.bottom + slack
   );
+}
+
+/* The buttons for a selection: Highlight, Add note, Copy. */
+function selectionButtons(actions) {
+  const out = [];
+  if (actions.highlight) out.push({ icon: 'highlighter', label: 'Highlight', run: actions.highlight });
+  if (actions.note) out.push({ icon: 'sticky-note', label: 'Add note', run: actions.note });
+  out.push({ icon: 'copy', label: 'Copy', run: actions.copy });
+  return out;
+}
+
+/* The word under a point, as a range, or null where there is none. Our own
+   highlight boxes are let through, so the word beneath one is found. */
+function wordRangeAt(doc, x, y) {
+  doc.body.classList.add('mpa-hit-through');
+  let caret;
+  try {
+    caret = caretRangeAt(doc, x, y);
+  } finally {
+    doc.body.classList.remove('mpa-hit-through');
+  }
+  const node = caret && caret.startContainer;
+  if (!node || node.nodeType !== 3) return null;
+  const isWord = (ch) => !!ch && WORD_CHAR_RE.test(ch);
+  let offset = caret.startOffset;
+  if (!isWord(node.nodeValue[offset]) && isWord(node.nodeValue[offset - 1])) offset--;
+  if (!isWord(node.nodeValue[offset])) return null;
+  /* The text nodes of the block the word is in, so a word a PDF has split
+     across two runs of text is found whole. */
+  const block = (node.parentElement && node.parentElement.closest('.textLayer, p, li, h1, h2, h3, h4, h5, h6, div')) || doc.body;
+  const walker = doc.createTreeWalker(block, NodeFilter.SHOW_TEXT);
+  const nodes = [];
+  let n;
+  while ((n = walker.nextNode())) nodes.push(n);
+  let k = nodes.indexOf(node);
+  if (k < 0) return null;
+  let startNode = node;
+  let start = offset;
+  for (;;) {
+    while (start > 0 && isWord(startNode.nodeValue[start - 1])) start--;
+    const before = start === 0 && k > 0 ? nodes[k - 1] : null;
+    if (!before || !isWord(before.nodeValue[before.nodeValue.length - 1])) break;
+    startNode = before;
+    start = before.nodeValue.length;
+    k--;
+  }
+  k = nodes.indexOf(node);
+  let endNode = node;
+  let end = offset;
+  for (;;) {
+    while (end < endNode.nodeValue.length && isWord(endNode.nodeValue[end])) end++;
+    const after = end === endNode.nodeValue.length && k < nodes.length - 1 ? nodes[k + 1] : null;
+    if (!after || !isWord(after.nodeValue[0])) break;
+    endNode = after;
+    end = 0;
+    k++;
+  }
+  const range = doc.createRange();
+  range.setStart(startNode, start);
+  range.setEnd(endNode, end);
+  return range;
 }
 
 /* The last line of a selection, ignoring the zero-sized and page-sized boxes
@@ -3438,6 +3543,7 @@ class AnnotationsView extends ItemView {
        until it is let go, so a card cannot vanish between press and click. */
     this.pressing = false;
     this.registerDomEvent(root, 'pointerdown', () => (this.pressing = true), { capture: true });
+
     this.registerDomEvent(window, 'pointerup', () => {
       if (!this.pressing) return;
       this.pressing = false;
@@ -3560,7 +3666,18 @@ class AnnotationsView extends ItemView {
      clicked. Measured all at once, then marked, so the page is laid out once
      rather than once per card. A sidebar that is not on screen has nothing
      to measure; it is measured when it is shown. */
+  /* A note longer than five lines is cut there, fading, while it is not
+     being typed in, as a long quote is. */
+  measureNote(field) {
+    if (!field.isConnected || !field.clientWidth) return;
+    const line = parseFloat(getComputedStyle(field).lineHeight) || 0;
+    if (!line) return;
+    const padding = parseFloat(getComputedStyle(field).paddingTop) + parseFloat(getComputedStyle(field).paddingBottom) || 0;
+    field.toggleClass('is-long', field.scrollHeight - padding > line * QUOTE_LINES + 1);
+  }
+
   measureQuotes(cards) {
+    for (const card of cards) if (card.note) this.measureNote(card.note);
     const found = [];
     for (const card of cards) {
       const quote = card.quote;
@@ -3754,6 +3871,7 @@ class AnnotationsView extends ItemView {
     /* Leaving a box whose note no longer matches the search hides it then,
        not while it is being typed in. */
     field.addEventListener('blur', () => {
+      this.measureNote(field);
       if (!this.searching()) return;
       if (this.pressing) this.refilterPending = true;
       else setTimeout(() => this.applyFilter(), 0);
@@ -3783,6 +3901,7 @@ class AnnotationsView extends ItemView {
 
   /* Grows a note box to fit what is in it, where the browser cannot. */
   fit(field) {
+    this.measureNote(field);
     if (FIELD_SIZING || !field.isConnected) return;
     field.style.setProperty('--mpa-note-height', 'auto');
     field.style.setProperty('--mpa-note-height', `${field.scrollHeight}px`);
@@ -3816,14 +3935,17 @@ class AnnotationsView extends ItemView {
   }
 
   openMenu(card, e) {
-    const menu = new Menu();
-    menu.addItem((item) =>
-      item
-        .setTitle(card.kind === 'highlight' ? 'Delete highlight' : 'Delete note')
-        .setIcon('trash')
-        .onClick(() => this.plugin.deleteAnnotation(card.doc, card.id))
-    );
-    menu.showAtMouseEvent(e);
+    const buttons = [
+      { icon: 'trash-2', label: card.kind === 'highlight' ? 'Delete highlight' : 'Delete note', run: () => this.plugin.deleteAnnotation(card.doc, card.id) },
+    ];
+    this.plugin.selectionBar.show({ left: e.clientX, right: e.clientX, top: e.clientY, bottom: e.clientY }, buttons, this.containerEl.ownerDocument);
+  }
+
+  /* A click anywhere but the card in hand lets it go. Told by the plugin,
+     which listens in every window. */
+  pressedElsewhere(e) {
+    const card = this.cards.get(this.selectedId);
+    if (card && !(isNode(e.target) && card.el.contains(e.target))) this.select(null);
   }
 
   /* Scrolls a card into view, briefly marks it, and optionally puts the
@@ -3837,9 +3959,6 @@ class AnnotationsView extends ItemView {
     if (card.el.hasClass('mpa-hidden')) this.clearSearch();
     if (opts.select !== false) this.select(id);
     card.el.scrollIntoView({ block: opts.block || 'nearest' });
-    card.el.removeClass('mpa-flash');
-    void card.el.offsetWidth;
-    card.el.addClass('mpa-flash');
     if (opts.focusNote) {
       card.note.focus();
       const end = card.note.value.length;

@@ -78,8 +78,7 @@
 /* A negative delay, set from script, lets an element redrawn halfway through
    carry on from where the last one was instead of starting again. */
 .mpa-highlight.mpa-flash,
-.mpa-note-icon.mpa-flash,
-.mpa-card.mpa-flash {
+.mpa-note-icon.mpa-flash {
   animation: mpa-flash 1.2s ease-in-out;
   animation-delay: var(--mpa-flash-delay, 0s);
   animation-fill-mode: both;
@@ -150,9 +149,12 @@
   outline: none;
 }
 
+/* The card in hand: a bold outline in the text colour, which goes when you
+   click anywhere else. */
 .mpa-card.is-selected,
 .mpa-card:focus-visible {
-  border-color: var(--interactive-accent);
+  border-color: var(--text-normal);
+  box-shadow: 0 0 0 1px var(--text-normal);
 }
 
 .mpa-card-head {
@@ -224,13 +226,17 @@
 .mpa-card-delete {
   flex: none;
   padding: 2px;
-  opacity: 0;
+  color: var(--text-faint);
 }
 
-.mpa-card:hover .mpa-card-delete,
-.mpa-card.is-selected .mpa-card-delete,
+.mpa-card-delete svg {
+  width: 13px;
+  height: 13px;
+}
+
+.mpa-card-delete:hover,
 .mpa-card-delete:focus-visible {
-  opacity: 1;
+  color: var(--text-normal);
 }
 
 /* Starts as one line, grows as the note does. Browsers that cannot grow a
@@ -255,6 +261,13 @@
   resize: none;
   overflow: hidden;
   field-sizing: content;
+}
+
+/* A long note, while not being typed in: five lines, the last fading. */
+.mpa-card-note.is-long:not(:focus) {
+  max-height: calc(5lh + 8px);
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 1lh - 4px), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 1lh - 4px), transparent);
 }
 
 .mpa-card-note:hover {
@@ -315,6 +328,11 @@ body.mpa-mode-active .textLayer ::selection {
 }
 
 /* -------------------------------------------------------- selection bar */
+
+/* Finding the word under a right-click looks through our highlight boxes. */
+body.mpa-hit-through .mpa-highlight {
+  pointer-events: none !important;
+}
 
 .mpa-selection-bar {
   position: fixed;
