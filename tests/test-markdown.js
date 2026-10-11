@@ -75,7 +75,7 @@ m._compile(
     "snapStart,snapEnd,selectedSlice,linesFromChars,textOfChars,snapshot,NoteHistory," +
     "annotationItems,compareOrder,findAnnotation,annotationTarget,flashing,flashElapsed,pdfInnerOf,AnnotationsView," +
     "searchWords,wordMatches,editDistance,matchesQuery,destPoint,footnoteRegion," +
-    "resolveBookPath,drmProtected,snapOffset,findQuote,validTextSize,readZip,uprightPage,findQuoteAcross," +
+    "resolveBookPath,drmProtected,snapOffset,findQuote,validTextSize,readZip,uprightPage,findQuoteAcross,scopeCss,cssRules,scopeSelectorList," +
     "validZoom,pdfViewerOf,pruneZooms,placeBox,clampToViewport};\n",
   P
 );
@@ -2150,6 +2150,38 @@ console.log("\n--- clampToViewport");
     notices.length = 0;
     const damaged = await plugin.readSidecar(Object.assign(new TFile(), { path: "refs/paper.pdf" }));
     eq("while a damaged one is still kept read-only", damaged.ok, false);
+  }
+
+  console.log("\n--- a chapter's styles kept to that chapter");
+  {
+    const flat = (x) => x.replace(/\s+/g, " ").trim();
+    eq("rules go inside @scope, with body standing for the chapter",
+      flat(T.scopeCss("body { text-align: center; } p { margin: 0 }", "#mpa0")),
+      "@scope (#mpa0) { :scope { text-align: center; } p { margin: 0 } }");
+    eq("fonts stay where every chapter can use them",
+      flat(T.scopeCss("@font-face { font-family: X; src: url(a.otf) } p { font-family: X }", "#mpa3")),
+      "@font-face { font-family: X; src: url(a.otf) } @scope (#mpa3) { p { font-family: X } }");
+    eq("html body, and body with a class, become the chapter",
+      flat(T.scopeCss("html body p, body.calibre { color: red }", "#mpa1")),
+      "@scope (#mpa1) { :scope p, :scope.calibre { color: red } }");
+    eq("inside @media too",
+      flat(T.scopeCss("@media (min-width: 10em) { body { margin: 1em } }", "#mpa2")),
+      "@scope (#mpa2) { @media (min-width: 10em) { :scope { margin: 1em } } }");
+    eq("several chapters at once", flat(T.scopeCss("p{x:1}", "#mpa1, #mpa4")), "@scope (#mpa1, #mpa4) { p{x:1} }");
+    eq("words that only contain body are left alone", flat(T.scopeCss(".tbody, #body-text { x: 1 }", "#mpa0")), "@scope (#mpa0) { .tbody, #body-text { x: 1 } }");
+    eq("braces in comments and strings don't split rules",
+      T.cssRules("/* a { */ p { content: '}' } q { x: 1 }"), ["p { content: '}' }", "q { x: 1 }"]);
+    eq("html with a qualifier before body goes", T.scopeSelectorList("html[lang] body p"), ":scope p");
+    eq("body as a child of nothing in particular", T.scopeSelectorList("body > p"), ":scope > p");
+    eq("a class called html is not html", T.scopeSelectorList(".html body"), ".html :scope");
+    eq("nor is body in a quoted value", T.scopeSelectorList('[title=" body"] p'), '[title=" body"] p');
+    eq("each selector in a list", T.scopeSelectorList("body.a, html body .b"), ":scope.a, :scope .b");
+    eq("html alone is the chapter", T.scopeSelectorList("html"), ":scope");
+    eq("a stray closing brace is dropped, so nothing escapes the scope",
+      flat(T.scopeCss("p{a:b} } q{c:d}", "#mpa0")), "@scope (#mpa0) { p{a:b} q{c:d} }");
+    eq("an unfinished last rule is dropped", flat(T.scopeCss("p{a:b} r{e:", "#mpa0")), "@scope (#mpa0) { p{a:b} }");
+    eq("layer order statements stay shared", flat(T.scopeCss("@layer a, b; p{x:1}", "#mpa0")), "@layer a, b; @scope (#mpa0) { p{x:1} }");
+    eq("a stylesheet of nothing but fonts stays as it is", flat(T.scopeCss("@font-face { a: b }", "#mpa0")), "@font-face { a: b }");
   }
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);

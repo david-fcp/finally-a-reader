@@ -20,14 +20,18 @@ For me, this replaces Zotero and Zotero-like plugins. Enjoy!
 2. **Select text** in a PDF or an EPUB. It is highlighted as soon as you let
    go of the mouse, and appears in the sidebar.
 
-With highlight mode off, selecting text brings up a small bar beside it, as
-in Zotero: **Highlight**, **Add note** (highlights it and puts the cursor in
-its note) and **Copy**. It goes away when you click elsewhere, scroll or type.
+While highlight mode is on, text being selected shows in the highlight colour.
+
+With highlight mode off, selecting text brings up a small bar of icons beside
+it, as in Zotero: **Highlight**, **Add note** (highlights it and puts the
+cursor in its note) and **Copy**. It goes away when you click elsewhere, scroll or type.
 Right-clicking selected text offers Highlight too.
 
 PDFs and books look the same: the top of the tab holds the highlighter and
-zoom buttons, and nothing else. In a book, zooming changes the text size,
-which is remembered for each book.
+the zoom buttons, and nothing else. Zooming a book works as it does a PDF:
+the page is magnified, its lines keep their length, and a page wider than the
+tab scrolls sideways. Each book's zoom, and the place you were reading, are
+remembered on each device.
 3. **Add a note** by typing in the "Add note" box under a highlight in the
    sidebar. Notes save as you type.
 
@@ -41,8 +45,8 @@ The sidebar opens by itself the first time you open a PDF or EPUB. The command
 - **Click a highlight's words in the sidebar** to go to it in the document.
 - **Right-click a bare part of the text** for "Add note", which makes a note of
   its own at that point.
-- **Delete** a highlight or note by right-clicking its card, from the ···
-  menu on it, or by selecting the card and pressing Delete. Right-clicking a
+- **Delete** a highlight or note with the trash can on its card, by
+  right-clicking the card, or by selecting the card and pressing Delete. Right-clicking a
   highlight in the document offers the same.
 - **Hover over a footnote or endnote marker** to read the note without
   leaving your place. Click the marker, or the preview, to jump to it. This

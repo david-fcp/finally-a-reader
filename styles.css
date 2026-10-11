@@ -221,15 +221,15 @@
   stroke: var(--text-normal);
 }
 
-.mpa-card-more {
+.mpa-card-delete {
   flex: none;
   padding: 2px;
   opacity: 0;
 }
 
-.mpa-card:hover .mpa-card-more,
-.mpa-card.is-selected .mpa-card-more,
-.mpa-card-more:focus-visible {
+.mpa-card:hover .mpa-card-delete,
+.mpa-card.is-selected .mpa-card-delete,
+.mpa-card-delete:focus-visible {
   opacity: 1;
 }
 
@@ -294,6 +294,26 @@
   text-align: center;
 }
 
+/* While highlight mode is on, a selection being dragged out shows in the
+   highlight's colour, so what it will become is clear before letting go. */
+/* The viewer draws its text layer at a fifth of its strength, which would
+   leave the colour too pale to recognise; the layer's text is transparent,
+   so drawing it at full strength shows only the selection. */
+body.mpa-mode-active .textLayer {
+  opacity: 1;
+}
+
+/* Everything else the layer draws, such as search matches, keeps the strength
+   it had. */
+body.mpa-mode-active .textLayer > :not(span),
+body.mpa-mode-active .textLayer .highlight {
+  opacity: 0.2;
+}
+
+body.mpa-mode-active .textLayer ::selection {
+  background: color-mix(in srgb, var(--mpa-mode-color, #ffeb3b) 40%, transparent);
+}
+
 /* -------------------------------------------------------- selection bar */
 
 .mpa-selection-bar {
@@ -316,7 +336,7 @@
   align-items: center;
   gap: 4px;
   height: auto;
-  padding: 3px 8px;
+  padding: 4px 6px;
   border: none;
   border-radius: var(--radius-s);
   background-color: transparent;

@@ -71,7 +71,13 @@ const EPUB_VIEW_TYPE = 'mpa-epub';
 /* An EPUB's text size, per book and per device like a PDF's zoom, as a
    percentage of the normal size. */
 const TEXT_SIZE_STORE_KEY = 'epub-text-size';
-const TEXT_SIZES = [70, 80, 90, 100, 110, 120, 135, 150, 175, 200];
+const TEXT_SIZES = [70, 80, 90, 100, 110, 120, 135, 150, 175, 200, 250, 300];
+
+/* A book page's line length at 100%, in ems, when the tab is wide enough. */
+const EPUB_LINE_EMS = 44;
+
+/* Where each book was left, per device, as [chapter, offset]. */
+const PLACE_STORE_KEY = 'epub-place';
 
 class MinimalPdfAnnotatorPlugin extends Plugin {
   async onload() {
@@ -107,6 +113,8 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
 
     this.registerView(SIDEBAR_VIEW_TYPE, (leaf) => new AnnotationsView(leaf, this));
     this.textSizes = this.readTextSizes();
+    this.places = this.readPlaces();
+    this.savePlaces = debounce(() => this.writePlaces(), 1000, false);
     this.registerView(EPUB_VIEW_TYPE, (leaf) => new EpubView(leaf, this));
     try {
       this.registerExtensions(['epub'], EPUB_VIEW_TYPE);
@@ -227,6 +235,8 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
   }
 
   onunload() {
+    /* A place in a book noted in the last second is kept. */
+    if (this.places) this.writePlaces();
     if (this.footnotes) this.footnotes.hide();
     if (this.selectionBar) this.selectionBar.hide();
     for (const state of this.views.values()) this.syncZoom(state);
@@ -316,6 +326,37 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
       if (validTextSize(stored[path])) out[path] = stored[path];
     }
     return out;
+  }
+
+  readPlaces() {
+    const out = {};
+    let stored = null;
+    try {
+      stored = this.app.loadLocalStorage(PLACE_STORE_KEY);
+    } catch (e) {
+      return out;
+    }
+    if (!stored || typeof stored !== 'object') return out;
+    for (const path of Object.keys(stored)) {
+      const at = stored[path];
+      if (Array.isArray(at) && at.length === 2 && at.every((n) => Number.isInteger(n) && n >= 0)) out[path] = at;
+    }
+    return out;
+  }
+
+  notePlace(path, at) {
+    delete this.places[path];
+    this.places[path] = at;
+    pruneZooms(this.places, ZOOM_LIMIT);
+    this.savePlaces();
+  }
+
+  writePlaces() {
+    try {
+      this.app.saveLocalStorage(PLACE_STORE_KEY, this.places);
+    } catch (e) {
+      this.report('could not save the place in a book', e);
+    }
   }
 
   noteTextSize(path, value) {
@@ -1767,6 +1808,10 @@ class EpubView extends FileView {
     this.hidePreview();
     if (this.resizeObserver) this.resizeObserver.disconnect();
     this.resizeObserver = null;
+    if (this.frameObserver) this.frameObserver.disconnect();
+    this.frameObserver = null;
+    if (this.placeTimer) window.clearTimeout(this.placeTimer);
+    this.place = null;
     if (this.book) revokeBook(this.book);
     this.book = null;
     this.frame = null;
@@ -1833,8 +1878,36 @@ class EpubView extends FileView {
     this.listen(d);
     /* Text reflows when the pane is resized, the text size changes, or an
        image arrives, and the highlights must follow it. */
-    this.resizeObserver = new ResizeObserver(() => this.scheduleRedraw());
+    this.resizeObserver = new ResizeObserver(() => {
+      if (this.holding && Date.now() < this.holding.until) this.scrollToPosition(this.holding.at, 0);
+      this.scheduleRedraw();
+    });
     this.resizeObserver.observe(body);
+    for (const type of ['wheel', 'keydown', 'mousedown', 'touchstart']) {
+      d.addEventListener(type, () => (this.holding = null), { capture: true, passive: true });
+    }
+    /* The tab itself: a new width lays the page out again; being shown again
+       after being hidden goes back to the place it was at. */
+    this.wasVisible = this.visible();
+    this.frameObserver = new ResizeObserver(() => {
+      const shown = this.visible();
+      if (shown) {
+        const at = this.place;
+        this.applyTextSize();
+        if (at && !this.wasVisible) this.scrollToPosition(at, 0);
+      }
+      this.wasVisible = shown;
+    });
+    this.frameObserver.observe(frame);
+    /* Back to where this book was left. */
+    const saved = this.file && this.plugin.places[this.file.path];
+    if (saved) {
+      this.place = saved;
+      this.scrollToPosition(saved, 0);
+      /* Pictures and fonts arrive after this and move the text, so the place
+         is held for a moment, until they have or the reader moves. */
+      this.holding = { at: saved, until: Date.now() + 3000 };
+    }
   }
 
   /* The frame uses Obsidian's colours and fonts as its defaults, which a
@@ -1856,9 +1929,21 @@ class EpubView extends FileView {
     return validTextSize(stored) ? stored : 100;
   }
 
+  /* Zoom works as it does on a PDF: the page is laid out once, as wide as
+     the tab allows up to a comfortable line length, and zooming magnifies
+     that page rather than re-wrapping the text, so lines keep their length
+     and a page wider than the tab scrolls sideways. */
   applyTextSize() {
     const d = this.frame && this.frame.contentDocument;
-    if (d) d.documentElement.style.fontSize = `${this.textSize()}%`;
+    if (!d || !d.body) return;
+    const em = parseFloat(getComputedStyle(d.documentElement).fontSize) || 16;
+    const room = d.documentElement.clientWidth;
+    if (room > 0) d.body.style.width = `${Math.min(EPUB_LINE_EMS * em, room)}px`;
+    d.body.style.zoom = String(this.textSize() / 100);
+  }
+
+  zoomFactor() {
+    return this.textSize() / 100;
   }
 
   /* Keeps the words at the top of the window in place while the text grows
@@ -1873,12 +1958,35 @@ class EpubView extends FileView {
     this.plugin.noteTextSize(this.file.path, next);
     this.applyTextSize();
     if (at) this.scrollToPosition(at, 0);
+    this.scheduleRedraw();
   }
 
+  /* The place in the book at the top of the window. */
   topPosition() {
     const d = this.frame.contentDocument;
-    const range = caretRangeAt(d, d.body.getBoundingClientRect().left + d.body.clientWidth / 2, 4);
-    return range ? this.positionOf(range.startContainer, range.startOffset) : null;
+    const box = d.body.getBoundingClientRect();
+    const across = Math.min(Math.max(box.left + box.width / 2, 1), d.documentElement.clientWidth - 1);
+    for (const down of [4, 24, 48, 96]) {
+      const range = caretRangeAt(d, across, down);
+      const at = range && this.positionOf(range.startContainer, range.startOffset);
+      if (at) return at;
+    }
+    return null;
+  }
+
+  /* Noted as you read, so the place survives the tab being hidden, which
+     makes the browser forget the frame's scroll, and the book being closed. */
+  notePlace() {
+    if (!this.frame || !this.file || !this.visible()) return;
+    if (this.holding && Date.now() < this.holding.until) return;
+    const at = this.topPosition();
+    if (!at) return;
+    this.place = at;
+    this.plugin.notePlace(this.file.path, at);
+  }
+
+  visible() {
+    return !!this.frame && this.frame.clientWidth > 0 && this.frame.clientHeight > 0;
   }
 
   /* -------------------------------------------------- offsets and ranges */
@@ -1966,10 +2074,16 @@ class EpubView extends FileView {
   redraw() {
     const state = this.plugin.views.get(this);
     if (!state || !state.doc || !this.layer) return;
+    this.refreshModeButton();
     const d = this.frame.contentDocument;
     const origin = d.body.getBoundingClientRect();
     const settings = this.plugin.settings;
     const layer = this.layer;
+    /* Boxes come back magnified by the zoom, and positions set inside the
+       page are magnified again, so they are divided back. What is kept for
+       finding the highlight under a click stays as measured. */
+    const z = this.zoomFactor();
+    const px = (v) => `${v / z}px`;
     while (layer.firstChild) layer.removeChild(layer.firstChild);
     this.drawn.clear();
 
@@ -1978,7 +2092,7 @@ class EpubView extends FileView {
       el.className = 'mpa-note-icon';
       el.dataset.noteId = id;
       el.dataset.noteKind = kind;
-      el.style.setProperty('--mpa-y', `${top}px`);
+      el.style.setProperty('--mpa-y', px(top));
       el.style.setProperty('--mpa-color', color);
       el.innerHTML = NOTE_ICON_SVG;
       markFrameFlash(el, state, id);
@@ -2001,10 +2115,10 @@ class EpubView extends FileView {
         const el = d.createElement('div');
         el.className = 'mpa-highlight';
         el.dataset.highlightId = h.id;
-        el.style.setProperty('--mpa-x', `${r.left}px`);
-        el.style.setProperty('--mpa-y', `${r.top}px`);
-        el.style.setProperty('--mpa-w', `${r.width}px`);
-        el.style.setProperty('--mpa-h', `${r.height}px`);
+        el.style.setProperty('--mpa-x', px(r.left));
+        el.style.setProperty('--mpa-y', px(r.top));
+        el.style.setProperty('--mpa-w', px(r.width));
+        el.style.setProperty('--mpa-h', px(r.height));
         el.style.setProperty('--mpa-color', color);
         markFrameFlash(el, state, h.id);
         layer.appendChild(el);
@@ -2030,7 +2144,10 @@ class EpubView extends FileView {
   refreshModeButton() {
     if (this.modeButton) this.plugin.styleModeButton(this.modeButton);
     const d = this.frame && this.frame.contentDocument;
-    if (d) d.documentElement.classList.toggle('mpa-mode-active', this.plugin.highlightMode);
+    if (d) {
+      d.documentElement.classList.toggle('mpa-mode-active', this.plugin.highlightMode);
+      d.documentElement.style.setProperty('--mpa-mode-color', this.plugin.settings.highlightColor);
+    }
   }
 
   /* Scrolls an annotation to a third of the way down the window. */
@@ -2140,6 +2257,8 @@ class EpubView extends FileView {
     win.addEventListener('scroll', () => {
       this.hidePreview();
       plugin.selectionBar.hide();
+      if (this.placeTimer) window.clearTimeout(this.placeTimer);
+      this.placeTimer = window.setTimeout(() => this.notePlace(), 300);
     }, { passive: true });
   }
 
@@ -2409,7 +2528,7 @@ class EpubView extends FileView {
       this.hidePreview();
       this.scrollToRect(target.getBoundingClientRect(), 0.1);
     });
-    d.body.appendChild(el);
+    d.documentElement.appendChild(el);
     /* Faded at the foot only when there is more than fits. */
     if (inner.scrollHeight > inner.clientHeight + 1) inner.classList.add('is-long');
     const win = d.defaultView;
@@ -2737,8 +2856,12 @@ async function readBook(buffer, blobs) {
   }
 
   const sectionOf = new Map(spine.map((item, i) => [item.path, i]));
-  const styles = [];
-  const inlineStyles = [];
+  /* Which chapters use each stylesheet. A book is shown as one document, so
+     a stylesheet only some chapters link to, and the styles written inside a
+     chapter, are kept to those chapters: a title page's
+     "body { text-align: center }" would otherwise centre the whole book. */
+  const linked = new Map();
+  const inline = new Map();
   const sections = [];
   for (const [i, item] of spine.entries()) {
     const text = (await zip.text(item.path)) || '';
@@ -2746,17 +2869,26 @@ async function readBook(buffer, blobs) {
     if (broken(d)) d = parse(text, 'text/html');
     for (const link of Array.from(d.querySelectorAll('link[rel~="stylesheet"][href]'))) {
       const css = sheets.get(resolveBookPath(item.path, link.getAttribute('href')));
-      if (css !== undefined && !styles.includes(css)) styles.push(css);
+      if (css === undefined) continue;
+      if (!linked.has(css)) linked.set(css, new Set());
+      linked.get(css).add(i);
     }
     for (const style of Array.from(d.querySelectorAll('style'))) {
       const css = rewriteCss(style.textContent || '', item.path);
-      if (!inlineStyles.includes(css)) inlineStyles.push(css);
+      if (!inline.has(css)) inline.set(css, new Set());
+      inline.get(css).add(i);
     }
     const body = d.body || d.getElementsByTagName('body')[0] || d.documentElement;
     prepareChapter(body, i, item.path, urls, sectionOf);
     sections.push({ body, bodyClass: body.getAttribute && body.getAttribute('class') });
   }
 
+  const roots = (users) => Array.from(users, (i) => `#mpa${i}`).join(', ');
+  const inlineStyles = Array.from(inline, ([css, users]) => scopeCss(css, roots(users)));
+  const styles = [];
+  for (const [css, users] of linked) {
+    styles.push(users.size === spine.length ? css : scopeCss(css, roots(users)));
+  }
   return { title: titleEl ? titleEl.textContent.trim() : '', sections, styles, inlineStyles, blobs };
 }
 
@@ -2801,6 +2933,131 @@ function prepareChapter(body, index, path, urls, sectionOf) {
   }
 }
 
+/* A stylesheet kept to some chapters, given as a selector for their
+   sections. Its rules go inside @scope, where "body" and "html" stand for the
+   chapter itself. Fonts, imports and page boxes cannot be scoped and are
+   harmless to share, so they stay as they are. */
+function scopeCss(css, roots) {
+  const shared = [];
+  const scoped = [];
+  for (const rule of cssRules(css)) {
+    if (/^@(font-face|import|charset|namespace|page)\b/i.test(rule) || (/^@layer\b/i.test(rule) && !rule.includes('{'))) shared.push(rule);
+    else scoped.push(rootSelectorsToScope(rule));
+  }
+  if (!scoped.length) return shared.join('\n');
+  return `${shared.join('\n')}\n@scope (${roots}) {\n${scoped.join('\n')}\n}`;
+}
+
+/* A stylesheet's top-level rules, as text. Comments and quoted strings are
+   stepped over, so a brace inside either does not count. */
+function cssRules(css) {
+  const rules = [];
+  let start = 0;
+  let depth = 0;
+  for (let i = 0; i < css.length; i++) {
+    const c = css[i];
+    if (c === '/' && css[i + 1] === '*') {
+      const end = css.indexOf('*/', i + 2);
+      i = end < 0 ? css.length : end + 1;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      let k = i + 1;
+      while (k < css.length && css[k] !== c) k += css[k] === '\\' ? 2 : 1;
+      i = k;
+      continue;
+    }
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth = Math.max(0, depth - 1);
+      if (depth === 0) {
+        rules.push(css.slice(start, i + 1));
+        start = i + 1;
+      }
+    } else if (c === ';' && depth === 0) {
+      rules.push(css.slice(start, i + 1));
+      start = i + 1;
+    }
+  }
+  /* An unfinished last rule is left out, and so is anything that is neither
+     a block nor a statement, such as a stray closing brace, which would
+     otherwise close the @scope it is put in and let what follows out. */
+  return rules
+    .map((r) => r.replace(/^(\s|\/\*[\s\S]*?\*\/)+/, '').trim())
+    .filter((r) => r && (r.endsWith('}') ? r.includes('{') : r.endsWith(';') && r.startsWith('@')));
+}
+
+/* "body", "html" and "html body" in a rule's selectors become ":scope",
+   inside @media and @supports too. */
+function rootSelectorsToScope(rule) {
+  const open = rule.indexOf('{');
+  if (open < 0) return rule;
+  const prelude = rule.slice(0, open);
+  const inner = rule.slice(open + 1, rule.lastIndexOf('}'));
+  if (prelude.trim().startsWith('@')) {
+    return `${prelude}{\n${cssRules(inner).map(rootSelectorsToScope).join('\n')}\n}`;
+  }
+  return `${scopeSelectorList(prelude)}{${inner}}`;
+}
+
+/* Each selector in a list, with html and body standing for the chapter: a
+   leading html is dropped when a body follows it, and the rest of html or
+   body becomes :scope, keeping any class, id or attribute on it. Quoted
+   values and brackets are stepped over, so ".html" or [title=" body"] are
+   left as they are. */
+function scopeSelectorList(list) {
+  return splitTopLevel(list, (c) => c === ',')
+    .map((selector) => {
+      const parts = splitTopLevel(selector, (c) => /[\s>+~]/.test(c), true);
+      const compounds = parts.filter((p) => !/^[\s>+~]+$/.test(p));
+      const root = (p) => /^(html|body)(?![\w-])/i.test(p);
+      if (compounds.length > 1 && /^html(?![\w-])/i.test(compounds[0]) && /^body(?![\w-])/i.test(compounds[1])) {
+        const first = parts.indexOf(compounds[0]);
+        const second = parts.indexOf(compounds[1]);
+        parts.splice(first, second - first);
+      }
+      return parts.map((p) => (root(p) ? p.replace(/^(html|body)/i, ':scope') : p)).join('');
+    })
+    .join(',');
+}
+
+/* Splits a selector at characters `at` accepts, outside quotes, brackets
+   and parentheses. With `keep`, the separators are kept as pieces of their
+   own. */
+function splitTopLevel(text, at, keep) {
+  const out = [];
+  let piece = '';
+  let separator = '';
+  let depth = 0;
+  let quote = null;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quote) {
+      piece += c;
+      if (c === '\\' && i + 1 < text.length) piece += text[++i];
+      else if (c === quote) quote = null;
+      continue;
+    }
+    if (c === '"' || c === "'") quote = c;
+    else if (c === '[' || c === '(') depth++;
+    else if (c === ']' || c === ')') depth = Math.max(0, depth - 1);
+    if (depth === 0 && !quote && at(c)) {
+      if (piece) out.push(piece);
+      piece = '';
+      if (keep) separator += c;
+      continue;
+    }
+    if (separator) {
+      out.push(separator);
+      separator = '';
+    }
+    piece += c;
+  }
+  if (separator && keep) out.push(separator);
+  if (piece) out.push(piece);
+  return keep ? out : out.map((p) => p);
+}
+
 function revokeBook(book) {
   for (const url of (book && book.blobs) || []) URL.revokeObjectURL(url);
 }
@@ -2815,7 +3072,6 @@ html { background: {{background-primary|#fff}}; }
 body {
   box-sizing: border-box;
   position: relative;
-  max-width: 44em;
   margin: 0 auto;
   padding: 2.5em 3.5em 50vh;
   color: {{text-normal|#222}};
@@ -2830,6 +3086,8 @@ a { color: {{text-accent|#2878c8}}; }
 .mpa-epub-footnote {
   background: {{background-primary|#fff}};
   color: {{text-normal|#222}};
+  font-family: {{font-text|serif}};
+  line-height: 1.5;
   border: 1px solid {{background-modifier-border|#ddd}};
 }
 `;
@@ -2856,6 +3114,7 @@ const EPUB_FRAME_CSS = `
   filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.25));
 }
 .mpa-note-icon svg { width: 14px; height: 14px; fill: var(--mpa-color, #ffeb3b); stroke: #333; stroke-width: 1.4; }
+html.mpa-mode-active ::selection { background: color-mix(in srgb, var(--mpa-mode-color, #ffeb3b) 55%, transparent); }
 @keyframes mpa-flash {
   0%, 50%, 100% { box-shadow: 0 0 0 0 transparent; }
   25%, 75% { box-shadow: 0 0 0 3px var(--mpa-color, #2878c8); }
@@ -3070,7 +3329,6 @@ class SelectionBar {
     const button = (icon, label, run) => {
       const b = el.createEl('button', { cls: 'mpa-selection-button', attr: { 'aria-label': label } });
       setIcon(b.createSpan({ cls: 'mpa-selection-icon' }), icon);
-      b.createSpan({ text: label });
       b.addEventListener('mousedown', (e) => e.preventDefault());
       b.addEventListener('click', (e) => {
         e.preventDefault();
@@ -3412,11 +3670,15 @@ class AnnotationsView extends ItemView {
       label.addEventListener('click', () => this.activate(card));
     }
 
-    const more = head.createDiv({ cls: 'mpa-card-more clickable-icon', attr: { 'aria-label': 'More' } });
-    setIcon(more, 'more-horizontal');
-    more.addEventListener('click', (e) => {
+    /* Deleting is one click: Cmd+Z brings it back. */
+    const remove = head.createDiv({
+      cls: 'mpa-card-delete clickable-icon',
+      attr: { 'aria-label': item.kind === 'highlight' ? 'Delete highlight' : 'Delete note' },
+    });
+    setIcon(remove, 'trash-2');
+    remove.addEventListener('click', (e) => {
       e.stopPropagation();
-      this.openMenu(card, e);
+      this.plugin.deleteAnnotation(card.doc, card.id);
     });
 
     card.note = el.createEl('textarea', {
@@ -4475,13 +4737,13 @@ function footnoteRegion(items, view, point, minWidth) {
 
 /* The buttons in the header of a PDF's or a book's tab: highlight mode, zoom
    in and zoom out, the same for both. In a book, zooming is the text size.
-   Each new button goes to the left of those before it, so they read: zoom
-   out, zoom in, highlight mode. */
+   Each new button goes to the left of those before it, so they are added
+   last first, to read: highlight mode, zoom out, zoom in. */
 function headerButtons(view, act) {
-  const mode = view.addAction('highlighter', 'Toggle highlight mode', act.mode);
-  mode.addClass('mpa-mode-action');
   const zoomIn = view.addAction('zoom-in', 'Zoom in', act.zoomIn);
   const zoomOut = view.addAction('zoom-out', 'Zoom out', act.zoomOut);
+  const mode = view.addAction('highlighter', 'Toggle highlight mode', act.mode);
+  mode.addClass('mpa-mode-action');
   return { mode, zoomIn, zoomOut };
 }
 
