@@ -38,6 +38,9 @@ class MenuStub {
     this.items.push(item);
     return this;
   }
+  addSeparator() {
+    return this;
+  }
   showAtMouseEvent() {
     this.shown = true;
   }
@@ -1361,14 +1364,58 @@ function menuFor(hit) {
   };
   plugin.addStandaloneNote = () => plugin.calls.push(["new standalone note"]);
   plugin.commit = () => {};
+  plugin.selectionBar = { hide() {} };
+  plugin.addHighlightsFromSelection = () => {
+    plugin.calls.push(["highlight the selection"]);
+    return "new";
+  };
+  plugin.showInSidebar = () => {};
   const event = { clientX: 10, clientY: 20, preventDefault() {} };
-  plugin.onContextMenu(event);
+  const before = global.window;
+  global.window = { getSelection: () => hit.selection || null };
+  try {
+    plugin.onContextMenu(event);
+  } finally {
+    global.window = before;
+  }
   return { plugin, menu: MenuStub.last };
 }
 const icon = (kind, id) => ({ dataset: { noteKind: kind, noteId: id } });
 const rectEl = (id) => ({ dataset: { highlightId: id } });
 const docWith = (data) => ({ data, readOnly: false });
 const page = {};
+
+{
+  /* Text selected in the PDF, with highlight mode off. */
+  const doc = docWith({ highlights: [], notes: [] });
+  const inside = {};
+  const selection = { isCollapsed: false, rangeCount: 1, getRangeAt: () => ({ commonAncestorContainer: inside, getClientRects: () => [{ left: 0, right: 100, top: 0, bottom: 40, width: 100 }] }), toString: () => "words" };
+  const { plugin, menu } = menuFor({
+    state: { doc, container: { contains: (n) => n === inside } },
+    pageEl: page,
+    highlightEl: null,
+    noteIconEl: null,
+    selection,
+  });
+  eq("a selection is offered for highlighting first", menu.items[0].title, "Highlight");
+  eq("then copying", menu.items[1].title, "Copy");
+  menu.items[0].click();
+  eq("and highlighting it highlights it", plugin.calls, [["highlight the selection"]]);
+}
+{
+  const doc = docWith({ highlights: [], notes: [] });
+  const inside = {};
+  const selection = { isCollapsed: false, rangeCount: 1, getRangeAt: () => ({ commonAncestorContainer: inside, getClientRects: () => [{ left: 500, right: 600, top: 500, bottom: 520, width: 100 }] }), toString: () => "words" };
+  const { menu } = menuFor({ state: { doc, container: { contains: (n) => n === inside } }, pageEl: page, highlightEl: null, noteIconEl: null, selection });
+  eq("a right-click away from the selection does not offer it", menu.items.some((i) => i.title === "Highlight"), false);
+}
+{
+  const doc = docWith({ highlights: [], notes: [] });
+  const elsewhere = {};
+  const selection = { isCollapsed: false, rangeCount: 1, getRangeAt: () => ({ commonAncestorContainer: elsewhere, getClientRects: () => [{ left: 0, right: 100, top: 0, bottom: 40, width: 100 }] }), toString: () => "words" };
+  const { menu } = menuFor({ state: { doc, container: { contains: () => false } }, pageEl: page, highlightEl: null, noteIconEl: null, selection });
+  eq("a selection somewhere else is not offered", menu.items.some((i) => i.title === "Highlight"), false);
+}
 
 {
   const doc = docWith({ highlights: [hl("quoted", [r(1, 0.5)], { id: "h1" })], notes: [] });

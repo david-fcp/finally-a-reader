@@ -23,7 +23,6 @@ const {
   Notice,
   TFile,
   Platform,
-  MarkdownRenderer,
   debounce,
   setIcon,
   normalizePath,
@@ -121,7 +120,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
       })
     );
 
-    this.ribbonEl = this.addRibbonIcon('highlighter', 'Toggle PDF highlight mode', () =>
+    this.ribbonEl = this.addRibbonIcon('highlighter', 'Toggle highlight mode', () =>
       this.toggleHighlightMode()
     );
 
@@ -129,7 +128,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
        ribbon is hidden. */
     this.statusEl = this.addStatusBarItem();
     this.statusEl.addClass('mpa-status');
-    this.statusEl.setAttribute('aria-label', 'Toggle PDF highlight mode');
+    this.statusEl.setAttribute('aria-label', 'Toggle highlight mode');
     this.registerDomEvent(this.statusEl, 'click', () => this.toggleHighlightMode());
     this.updateStatusEl();
 
@@ -158,41 +157,8 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
       },
     });
 
-    /* Cmd or Ctrl with Z already works inside a PDF, from onKeyDown. These
-       exist for the command palette, and for anyone who wants a second key of
-       their own; that key must not be the one onKeyDown handles, for the
-       reason given there. */
-    this.addCommand({
-      id: 'undo-annotation',
-      name: 'Undo last annotation change',
-      checkCallback: (checking) => {
-        const doc = this.activeDoc();
-        if (!doc || doc.readOnly || !doc.undoStack.length) return false;
-        if (!checking) this.undo(doc);
-        return true;
-      },
-    });
-
-    this.addCommand({
-      id: 'redo-annotation',
-      name: 'Redo last undone annotation change',
-      checkCallback: (checking) => {
-        const doc = this.activeDoc();
-        if (!doc || doc.readOnly || !doc.redoStack.length) return false;
-        if (!checking) this.redo(doc);
-        return true;
-      },
-    });
-
-    this.addCommand({
-      id: 'report-selection',
-      name: 'Report what the current selection looks like',
-      callback: () => {
-        this.writeSelectionReport().catch((e) => this.report('could not write the report', e));
-      },
-    });
-
     this.addSettingTab(new MinimalPdfAnnotatorSettingTab(this.app, this));
+    this.removeOldHelpFile().catch((e) => this.report('could not tidy away the old help file', e));
 
     this.registerEvent(
       this.app.vault.on('modify', (file) => {
@@ -224,6 +190,12 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     /* Footnote and endnote previews. Anything that moves the page, or any
        click outside the preview, puts it away. */
     this.footnotes = new FootnotePreview(this);
+    this.selectionBar = new SelectionBar(this);
+    this.registerDomEvent(document, 'mousedown', (e) => {
+      if (!this.selectionBar.contains(e.target)) this.selectionBar.hide();
+    }, true);
+    this.registerDomEvent(document, 'wheel', () => this.selectionBar.hide(), { capture: true, passive: true });
+    this.registerDomEvent(document, 'keydown', () => this.selectionBar.hide(), true);
     this.registerDomEvent(document, 'mouseover', (e) => this.footnotes.over(e));
     this.registerDomEvent(document, 'mouseout', (e) => this.footnotes.out(e));
     this.registerDomEvent(document, 'wheel', () => this.footnotes.hide(), { capture: true, passive: true });
@@ -241,6 +213,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
 
   onunload() {
     if (this.footnotes) this.footnotes.hide();
+    if (this.selectionBar) this.selectionBar.hide();
     for (const state of this.views.values()) this.syncZoom(state);
     /* Typing still waiting to be saved is saved now rather than dropped. */
     for (const doc of this.docs.values()) {
@@ -269,6 +242,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
   }
 
   toggleHighlightMode() {
+    if (this.selectionBar) this.selectionBar.hide();
     this.highlightMode = !this.highlightMode;
     document.body.toggleClass('mpa-mode-active', this.highlightMode);
     if (this.ribbonEl) this.ribbonEl.toggleClass('mpa-ribbon-active', this.highlightMode);
@@ -467,6 +441,15 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     state.observer = new MutationObserver(() => this.scheduleRedraw(state));
     state.observer.observe(container, { childList: true, subtree: true });
 
+    /* The same three buttons a book has, in the tab's header, in place of
+       the viewer's own toolbar, which the stylesheet hides. */
+    state.actions = headerButtons(view, {
+      mode: () => this.toggleHighlightMode(),
+      zoomIn: () => this.zoomPdf(state, 1),
+      zoomOut: () => this.zoomPdf(state, -1),
+    });
+    this.refreshToolbarButton(state);
+
     for (const other of this.views.values()) {
       if (other.doc === state.doc) this.render(other);
     }
@@ -484,9 +467,8 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     if (this.focusView === view) this.focusView = null;
     if (state.observer) state.observer.disconnect();
     if (state.frame) window.cancelAnimationFrame(state.frame);
-    state.container
-      .querySelectorAll('.mpa-layer, .mpa-toolbar-btn')
-      .forEach((el) => el.remove());
+    state.container.querySelectorAll('.mpa-layer').forEach((el) => el.remove());
+    if (state.actions && state.kind !== 'epub') for (const el of Object.values(state.actions)) el.remove();
     /* The annotations stay cached for the session. Dropping them here would
        discard a save still in flight, and would race a second tab that is
        part-way through loading the same PDF. */
@@ -635,25 +617,16 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     this.app.workspace.setActiveLeaf(leaf, { focus: true });
   }
 
-  /* The settings tab's explanatory text, from the editable file beside the
-     plugin. Created from the built-in text the first time it is wanted. */
-  async loadHelpText() {
-    const dir = this.manifest.dir;
-    if (!dir) return DEFAULT_HELP;
-    const path = normalizePath(`${dir}/${HELP_FILE}`);
+  /* Earlier versions wrote their settings-tab help text to a file beside the
+     plugin. The tab no longer shows it, so a copy nobody has edited is
+     removed. An edited one is someone's own writing and is left alone. */
+  async removeOldHelpFile() {
+    const dir = this.manifest && this.manifest.dir;
+    if (!dir) return;
+    const file = normalizePath(dir + '/settings-help.md');
     const adapter = this.app.vault.adapter;
-    try {
-      if (await adapter.exists(path)) {
-        const text = await adapter.read(path);
-        /* Written by an earlier version and never edited: the newer wording
-           replaces it. An edited copy is the reader's and is kept. */
-        if (!OLD_HELP_STAMPS.includes(stamp(text))) return text;
-      }
-      await adapter.write(path, DEFAULT_HELP);
-    } catch (e) {
-      this.report(`could not read or create ${path}, using the built-in text`, e);
-    }
-    return DEFAULT_HELP;
+    if (!(await adapter.exists(file))) return;
+    if (OLD_HELP_STAMPS.includes(stamp(await adapter.read(file)))) await adapter.remove(file);
   }
 
   /* ----------------------------------------------------------- dispatching */
@@ -743,17 +716,59 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
 
   onMouseDown(e) {
     if (e.button !== 0) return;
+    /* Only a press in a PDF: pressing a button on the selection bar must not
+       replace where the drag it is acting on began. */
+    if (!this.locate(e)) return;
     this.pointers.down = { x: e.clientX, y: e.clientY };
     this.pointers.up = null;
   }
 
   onMouseUp(e) {
-    if (!this.highlightMode || e.button !== 0) return;
-    this.pointers.up = { x: e.clientX, y: e.clientY };
+    if (e.button !== 0) return;
     const hit = this.locate(e);
-    if (!hit || !this.canEdit(hit.state.doc)) return;
-    const id = this.addHighlightsFromSelection(hit.state);
-    if (id) this.showInSidebar(hit.state.doc, id);
+    if (!hit) return;
+    this.pointers.up = { x: e.clientX, y: e.clientY };
+    if (this.highlightMode) {
+      if (!this.canEdit(hit.state.doc)) return;
+      const id = this.addHighlightsFromSelection(hit.state);
+      if (id) this.showInSidebar(hit.state.doc, id);
+      return;
+    }
+    /* Highlight mode off: a selection gets the small bar. After the browser
+       has settled the selection, which a double-click finishes later. */
+    const state = hit.state;
+    window.setTimeout(() => {
+      const selection = window.getSelection();
+      if (!selection || selection.isCollapsed || !selection.rangeCount) return;
+      const range = selection.getRangeAt(0);
+      if (!state.container.contains(range.commonAncestorContainer)) return;
+      this.selectionBar.show(selectionEnd(range), this.selectionActions(state.doc, () => this.addHighlightsFromSelection(state), () => selection.toString()));
+    }, 0);
+  }
+
+  /* What the selection bar and the right-click menu do with a selection, for
+     either kind of document: `make` turns the selection into a highlight and
+     returns its id. */
+  selectionActions(doc, make, text) {
+    const editable = !doc.readOnly;
+    const highlight = () => {
+      if (!this.canEdit(doc)) return null;
+      const id = make();
+      if (id) this.showInSidebar(doc, id);
+      return id;
+    };
+    return {
+      highlight: editable ? highlight : null,
+      note: editable
+        ? () => {
+            const id = highlight();
+            if (id) this.revealAnnotation(doc, id, true).catch((err) => this.report('could not show the note', err));
+          }
+        : null,
+      copy: () => {
+        navigator.clipboard.writeText(text()).catch((err) => this.report('could not copy', err));
+      },
+    };
   }
 
   onClick(e) {
@@ -788,6 +803,22 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     if (!highlightId && iconKind === 'highlight') highlightId = iconId;
 
     const menu = new Menu();
+    this.selectionBar.hide();
+
+    /* Text selected in this document: offer to highlight it. */
+    const selection = window.getSelection();
+    if (
+      selection &&
+      !selection.isCollapsed &&
+      selection.rangeCount &&
+      state.container.contains(selection.getRangeAt(0).commonAncestorContainer) &&
+      pointInRange(selection.getRangeAt(0), e.clientX, e.clientY)
+    ) {
+      const act = this.selectionActions(state.doc, () => this.addHighlightsFromSelection(state), () => selection.toString());
+      menu.addItem((item) => item.setTitle('Highlight').setIcon('highlighter').onClick(act.highlight));
+      menu.addItem((item) => item.setTitle('Copy').setIcon('copy').onClick(act.copy));
+      menu.addSeparator();
+    }
 
     /* A note asked for on top of a highlight belongs to that highlight, not to
        the point on the page. Making a standalone note there instead left it
@@ -1345,7 +1376,6 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
        is seen and the overlays are drawn again at the new scale. */
     this.syncZoom(state);
     this.withoutObserver(state, () => {
-      this.drawToolbarButton(state);
       this.drawHighlights(state);
     });
   }
@@ -1440,45 +1470,26 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     return el;
   }
 
-  /* A highlighter button in the PDF viewer's own toolbar, so the mode can be
-     reached without the ribbon or the status bar. */
-  drawToolbarButton(state) {
-    const toolbar =
-      state.container.querySelector('.pdf-toolbar') ||
-      state.container.querySelector('.pdf-toolbar-container') ||
-      state.container.querySelector('.pdf-container') ||
-      state.container;
-    const floating = !toolbar.matches('.pdf-toolbar, .pdf-toolbar-container');
-
-    let btn = toolbar.querySelector(':scope > .mpa-toolbar-btn');
-    if (!btn) {
-      /* A stale button from an earlier layout, now in the wrong container. */
-      state.container.querySelectorAll('.mpa-toolbar-btn').forEach((el) => el.remove());
-      btn = toolbar.createDiv({ cls: 'mpa-toolbar-btn clickable-icon' });
-      btn.setAttribute('aria-label', 'Toggle PDF highlight mode');
-      setIcon(btn, 'highlighter');
-      btn.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        this.toggleHighlightMode();
-      });
-    }
-    btn.toggleClass('mpa-toolbar-btn-floating', floating);
-    this.styleToolbarButton(btn);
-  }
-
   refreshToolbarButton(state) {
     if (state.kind === 'epub') {
       state.view.refreshModeButton();
       return;
     }
-    const btn = state.container.querySelector('.mpa-toolbar-btn');
-    if (btn) this.styleToolbarButton(btn);
+    if (state.actions) this.styleModeButton(state.actions.mode);
   }
 
-  styleToolbarButton(btn) {
+  styleModeButton(btn) {
     btn.toggleClass('is-active', this.highlightMode);
     btn.style.setProperty('--mpa-color', this.settings.highlightColor);
+  }
+
+  /* A zoom step, as the viewer's own buttons made one. */
+  zoomPdf(state, direction) {
+    const inner = pdfInnerOf(state.view);
+    if (!inner) return;
+    if (direction > 0 && typeof inner.increaseScale === 'function') inner.increaseScale();
+    else if (direction < 0 && typeof inner.decreaseScale === 'function') inner.decreaseScale();
+    else inner.currentScale = inner.currentScale * (direction > 0 ? 1.1 : 1 / 1.1);
   }
 
   /* ------------------------------------------------------------- settings */
@@ -1520,108 +1531,9 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
   }
 }
 
-/* The settings tab's explanatory text lives in a file beside the plugin, so
-   the wording can be edited without touching JavaScript. Obsidian's installer
-   only fetches main.js, manifest.json and styles.css, so the file cannot
-   simply be shipped: the text below is the source of truth, and the plugin
-   writes it out on first load if it is not already there. It is never
-   overwritten after that, so an edit survives. */
-const HELP_FILE = 'settings-help.md';
-
-/* Stamps of help text written out by earlier versions, so an unedited copy
-   can be recognised and brought up to date. Add the current text's stamp
-   here whenever DEFAULT_HELP changes. */
+/* Stamps of the help text earlier versions wrote out, to recognise a copy
+   nobody has edited. */
 const OLD_HELP_STAMPS = ['41f1859b-3282', 'a69ad533-3360'];
-
-const DEFAULT_HELP = `## How it works
-
-Turn on highlight mode from the ribbon, the status bar, or the highlighter
-button in a PDF's toolbar or at the top of a book, then select text in a PDF or
-an EPUB to highlight it.
-
-The annotations sidebar lists every highlight and note on the document in front
-of you. It opens by itself the first time you open one, and the command **Open
-annotations sidebar** brings it back.
-
-- **Click a card's words** to go to that place in the document.
-- **Type in "Add note"** under a highlight to annotate it. Notes save as you
-  type.
-- **Click a highlight in the document** to land in its note box in the
-  sidebar.
-- **Right-click a bare part of the text** for "Add note", which makes a note
-  of its own at that point.
-- **Delete** a highlight or note from the ··· menu on its card, or by
-  selecting the card and pressing Delete.
-- **Hover over a footnote or endnote marker** to read the note where you are.
-  Click the marker, or the preview, to go to it.
-
-A highlight longer than five lines is cut short in the sidebar. Click it once
-to read all of it, and again to go to it.
-
-**Search annotations** at the top of the sidebar filters the cards as you type,
-forgiving a slip or two in each word. Clicking a result shows it among all the
-others; clicking it again goes to it in the document. The button beside the
-search box switches between the order things appear in and the order you added
-them.
-
-## Making a note
-
-The note button at the top of the sidebar creates a note with the same name as
-the document, beside it, holding every highlight and note in reading order, and
-opens it. If that name is taken, a number is added. The note is yours: the
-plugin never changes it afterwards, so make another when you want an updated
-copy. How it is laid out is set above.
-
-## EPUB
-
-A book opens as one continuous scroll. **A+** and **A−** at the top change the
-text size, which is remembered for each book on this device. Books with DRM,
-and fixed-layout books such as picture books and magazines, can't be opened.
-
-## Undoing
-
-Cmd or Ctrl with Z steps back through the highlights and notes on the document
-you are looking at, and adding Shift steps forward again. The same keys keep
-their usual meaning everywhere else. Inside a note box they undo what you
-typed, grouped by pauses the way the rest of Obsidian groups it.
-
-They cannot be rebound. The keys are caught by the plugin rather than
-registered in Obsidian's hotkey settings, because a hotkey bound to this key
-would stop the editor's own undo working everywhere. There are also two
-commands, **Undo last annotation change** and **Redo last undone annotation
-change**, which you can reach from the command palette or give a second key of
-your own.
-
-The history goes fifty changes back per document, lives in memory, and is lost
-when Obsidian restarts. It is also cleared if the annotations file changes from
-outside the plugin, by a sync for instance, since by then it describes a
-document that no longer exists.
-
-## Zoom
-
-Each PDF reopens at the zoom you last read it at. This is kept per device,
-since a comfortable zoom depends on the screen in front of you, so it is not
-carried between machines.
-
-## Where your annotations live
-
-For \`refs/paper.pdf\`, the annotations are kept in \`refs/paper.annotations.json\`
-beside it. For \`refs/book.epub\`, they are kept in
-\`refs/book.epub.annotations.json\`. That file is the only copy of them, so keep
-it with its document when you move things around.
-
-## When a highlight comes out wrong
-
-Run the command **Report what the current selection looks like** with the
-problem text selected in a PDF. It writes a note describing what the viewer
-reports for every span in the selection, which is what explains the result.
-
----
-
-*This text lives in \`${HELP_FILE}\` in the plugin folder, so you can edit it.
-Reopen this tab to see your changes. The plugin only ever creates that file, so
-your wording is kept.*
-`;
 
 class MinimalPdfAnnotatorSettingTab extends PluginSettingTab {
   constructor(app, plugin) {
@@ -1696,30 +1608,6 @@ class MinimalPdfAnnotatorSettingTab extends PluginSettingTab {
           'zoom depends on the screen, so it is not carried between machines.'
       )
       .addToggle((toggle) => toggle.setValue(settings.rememberZoom).onChange((v) => save('rememberZoom', v)));
-
-    /* Reading the file is asynchronous and display() is not, so the text is
-       rendered into a container that is already in place. */
-    const help = containerEl.createDiv({ cls: 'mpa-help' });
-    this.renderHelp(help).catch((e) => {
-      this.plugin.report(`could not render ${HELP_FILE}`, e);
-      help.empty();
-      help.createEl('p', {
-        text: 'Turn on highlight mode from the ribbon, the status bar or the PDF toolbar, then select text in a PDF to highlight it.',
-        cls: 'setting-item-description',
-      });
-    });
-  }
-
-  async renderHelp(el) {
-    const markdown = await this.plugin.loadHelpText();
-    el.empty();
-    /* render() replaced renderMarkdown() during the 1.5 series; accept either
-       so the stated minimum app version holds. */
-    if (MarkdownRenderer.render) {
-      await MarkdownRenderer.render(this.app, markdown, el, '', this.plugin);
-    } else {
-      await MarkdownRenderer.renderMarkdown(markdown, el, '', this.plugin);
-    }
   }
 }
 
@@ -1789,9 +1677,11 @@ class EpubView extends FileView {
   }
 
   async onOpen() {
-    this.modeButton = this.addAction('highlighter', 'Toggle highlight mode', () => this.plugin.toggleHighlightMode());
-    this.addAction('a-arrow-up', 'Larger text', () => this.stepTextSize(1));
-    this.addAction('a-arrow-down', 'Smaller text', () => this.stepTextSize(-1));
+    this.modeButton = headerButtons(this, {
+      mode: () => this.plugin.toggleHighlightMode(),
+      zoomIn: () => this.stepTextSize(1),
+      zoomOut: () => this.stepTextSize(-1),
+    }).mode;
     this.refreshModeButton();
   }
 
@@ -2099,10 +1989,7 @@ class EpubView extends FileView {
   }
 
   refreshModeButton() {
-    if (this.modeButton) {
-      this.modeButton.toggleClass('is-active', this.plugin.highlightMode);
-      this.modeButton.style.setProperty('--mpa-color', this.plugin.settings.highlightColor);
-    }
+    if (this.modeButton) this.plugin.styleModeButton(this.modeButton);
     const d = this.frame && this.frame.contentDocument;
     if (d) d.documentElement.classList.toggle('mpa-mode-active', this.plugin.highlightMode);
   }
@@ -2153,6 +2040,7 @@ class EpubView extends FileView {
 
     d.addEventListener('keydown', (e) => {
       this.hidePreview();
+      plugin.selectionBar.hide();
       plugin.onKeyDown(e);
       if (e.defaultPrevented || !(e.metaKey || e.ctrlKey || e.altKey || e.key === 'Escape')) return;
       /* Copying, cutting, pasting and selecting all belong to the book's text. */
@@ -2182,7 +2070,11 @@ class EpubView extends FileView {
       if (copy.defaultPrevented) e.preventDefault();
     }, true);
     d.addEventListener('mousedown', (e) => {
+      plugin.selectionBar.hide();
       this.pressedAt = { x: e.clientX, y: e.clientY };
+      /* A click in the book never reaches Obsidian's window, where an open
+         menu listens for a click outside it, so the book closes it itself. */
+      if (this.menu) this.menu.hide();
       plugin.recentView = this;
       /* Clicking into the book makes it the document in front, as clicking
          into a PDF does: the sidebar follows. */
@@ -2191,7 +2083,12 @@ class EpubView extends FileView {
       this.hidePreview(true);
     });
     d.addEventListener('mouseup', (e) => {
-      if (e.button !== 0 || !plugin.highlightMode) return;
+      if (e.button !== 0) return;
+      if (!plugin.highlightMode) {
+        const s = state();
+        if (s && s.doc) window.setTimeout(() => this.offerSelection(s.doc), 0);
+        return;
+      }
       const s = state();
       if (!s || !s.doc || !plugin.canEdit(s.doc)) return;
       const id = this.highlightSelection(s.doc);
@@ -2201,7 +2098,10 @@ class EpubView extends FileView {
     d.addEventListener('contextmenu', (e) => this.onContextMenu(e, state()));
     d.addEventListener('mouseover', (e) => this.onOver(e));
     d.addEventListener('mouseout', (e) => this.onOut(e));
-    win.addEventListener('scroll', () => this.hidePreview(), { passive: true });
+    win.addEventListener('scroll', () => {
+      this.hidePreview();
+      plugin.selectionBar.hide();
+    }, { passive: true });
   }
 
   /* The highlight or note marker under a point, if any. */
@@ -2279,14 +2179,16 @@ class EpubView extends FileView {
       menu.addItem(build);
     };
     const selection = this.frame.contentWindow.getSelection();
-    const selected = selection && !selection.isCollapsed ? selection.toString() : '';
+    /* Only when the right-click is on the selection itself. */
+    const selected =
+      selection && !selection.isCollapsed && selection.rangeCount && pointInRange(selection.getRangeAt(0), e.clientX, e.clientY)
+        ? selection.toString()
+        : '';
+    plugin.selectionBar.hide();
     if (selected) {
-      add((item) =>
-        item
-          .setTitle('Copy')
-          .setIcon('copy')
-          .onClick(() => navigator.clipboard.writeText(selected))
-      );
+      const act = plugin.selectionActions(doc, () => this.highlightSelection(doc), () => selected);
+      if (act.highlight) add((item) => item.setTitle('Highlight').setIcon('highlighter').onClick(act.highlight));
+      add((item) => item.setTitle('Copy').setIcon('copy').onClick(act.copy));
     }
     const hit = this.hitAt(e.clientX, e.clientY);
     if (!doc.readOnly) {
@@ -2327,7 +2229,23 @@ class EpubView extends FileView {
     if (items) {
       const frameBox = this.frame.getBoundingClientRect();
       menu.showAtPosition({ x: frameBox.left + e.clientX, y: frameBox.top + e.clientY });
+      this.menu = menu;
+      menu.onHide(() => {
+        if (this.menu === menu) this.menu = null;
+      });
     }
+  }
+
+  /* Highlight mode off: a selection in the book gets the small bar. */
+  offerSelection(doc) {
+    if (!this.frame) return;
+    const selection = this.frame.contentWindow.getSelection();
+    if (!selection || selection.isCollapsed || !selection.rangeCount) return;
+    const frameBox = this.frame.getBoundingClientRect();
+    this.plugin.selectionBar.show(
+      selectionEnd(selection.getRangeAt(0), frameBox),
+      this.plugin.selectionActions(doc, () => this.highlightSelection(doc), () => selection.toString())
+    );
   }
 
   addNoteAt(doc, position) {
@@ -2870,8 +2788,6 @@ const EPUB_FRAME_CSS = `
   filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.25));
 }
 .mpa-note-icon svg { width: 14px; height: 14px; fill: var(--mpa-color, #ffeb3b); stroke: #333; stroke-width: 1.4; }
-html.mpa-mode-active body { cursor: text; }
-html.mpa-mode-active .mpa-section { cursor: crosshair; }
 @keyframes mpa-flash {
   0%, 50%, 100% { box-shadow: 0 0 0 0 transparent; }
   25%, 75% { box-shadow: 0 0 0 3px var(--mpa-color, #2878c8); }
@@ -3068,6 +2984,78 @@ class FootnotePreview {
   }
 }
 
+/* The small bar that appears by a selection when highlight mode is off, as
+   Zotero's does: Highlight, Add note, Copy. Not a menu: it holds nothing up,
+   and goes away by itself on a click elsewhere, a scroll or a key. Pressing
+   one of its buttons does not take the selection away, since the press is
+   kept from moving the focus. */
+class SelectionBar {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.el = null;
+  }
+
+  /* anchor: the selection's last line, in the window's coordinates. */
+  show(anchor, actions) {
+    this.hide();
+    const el = document.body.createDiv({ cls: 'mpa-selection-bar' });
+    const button = (icon, label, run) => {
+      const b = el.createEl('button', { cls: 'mpa-selection-button', attr: { 'aria-label': label } });
+      setIcon(b.createSpan({ cls: 'mpa-selection-icon' }), icon);
+      b.createSpan({ text: label });
+      b.addEventListener('mousedown', (e) => e.preventDefault());
+      b.addEventListener('click', (e) => {
+        e.preventDefault();
+        this.hide();
+        try {
+          run();
+        } catch (err) {
+          this.plugin.report(`could not ${label.toLowerCase()}`, err);
+        }
+      });
+    };
+    if (actions.highlight) button('highlighter', 'Highlight', actions.highlight);
+    if (actions.note) button('sticky-note', 'Add note', actions.note);
+    button('copy', 'Copy', actions.copy);
+    const at = placeBox(
+      { left: anchor.right - el.offsetWidth / 2, top: anchor.top, bottom: anchor.bottom },
+      { width: el.offsetWidth, height: el.offsetHeight },
+      { width: window.innerWidth, height: window.innerHeight }
+    );
+    el.style.left = `${at.left}px`;
+    el.style.top = `${at.top}px`;
+    this.el = el;
+  }
+
+  hide() {
+    if (this.el) this.el.remove();
+    this.el = null;
+  }
+
+  contains(node) {
+    return !!this.el && node instanceof Node && this.el.contains(node);
+  }
+}
+
+/* Whether a point, in the coordinates of the range's own window, lies on the
+   range: within a few pixels of one of its boxes. */
+function pointInRange(range, x, y) {
+  const slack = 3;
+  return Array.from(range.getClientRects()).some(
+    (r) => r.width > 0 && x >= r.left - slack && x <= r.right + slack && y >= r.top - slack && y <= r.bottom + slack
+  );
+}
+
+/* The last line of a selection, ignoring the zero-sized and page-sized boxes
+   a PDF's text layer can report. */
+function selectionEnd(range, offset) {
+  const rects = Array.from(range.getClientRects()).filter((r) => r.width > 0.5 && r.height > 0.5 && r.height < 200);
+  const r = rects[rects.length - 1] || range.getBoundingClientRect();
+  const dx = (offset && offset.left) || 0;
+  const dy = (offset && offset.top) || 0;
+  return { left: r.left + dx, right: r.right + dx, top: r.top + dy, bottom: r.bottom + dy };
+}
+
 class AnnotationsView extends ItemView {
   constructor(leaf, plugin) {
     super(leaf);
@@ -3221,7 +3209,7 @@ class AnnotationsView extends ItemView {
       !this.doc
         ? 'Open a PDF or an EPUB to see its annotations here.'
         : !this.cards.size
-          ? 'No annotations yet. Turn on highlight mode and select some text.'
+          ? 'No annotations yet'
           : 'No annotations match.'
     );
   }
@@ -3364,6 +3352,14 @@ class AnnotationsView extends ItemView {
       }
     });
     el.addEventListener('focusin', () => this.select(card.id));
+    /* Right-clicking a card offers what its ··· button does. Not inside the
+       note box, which keeps its own menu for pasting and spelling. */
+    el.addEventListener('contextmenu', (e) => {
+      if (e.target instanceof Element && e.target.closest('textarea')) return;
+      e.preventDefault();
+      this.select(card.id);
+      this.openMenu(card, e);
+    });
     return card;
   }
 
@@ -4314,6 +4310,18 @@ function footnoteRegion(items, view, point, minWidth) {
     .replace(/\s+/g, ' ')
     .trim();
   return { left, right, top, bottom, text };
+}
+
+/* The buttons in the header of a PDF's or a book's tab: highlight mode, zoom
+   in and zoom out, the same for both. In a book, zooming is the text size.
+   Each new button goes to the left of those before it, so they read: zoom
+   out, zoom in, highlight mode. */
+function headerButtons(view, act) {
+  const mode = view.addAction('highlighter', 'Toggle highlight mode', act.mode);
+  mode.addClass('mpa-mode-action');
+  const zoomIn = view.addAction('zoom-in', 'Zoom in', act.zoomIn);
+  const zoomOut = view.addAction('zoom-out', 'Zoom out', act.zoomOut);
+  return { mode, zoomIn, zoomOut };
 }
 
 function pdfInnerOf(view) {
