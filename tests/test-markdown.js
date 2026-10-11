@@ -71,11 +71,11 @@ m._compile(
     "\nmodule.exports.__t={renderExport,escapeLineStart,collapseWhitespace,stamp,pct,pageNumberOf,uuid," +
     "firstRect,migrateHighlight,dropRunningHeads,unionRect,pagePaddingBox," +
     "measurable,cell,round,blank,charAt,describePoint,sameLine,boundaryPosition," +
-    "indexOfBoundary,touchedBounds,refineBoundary,nearestPointer,isWordChar,insideWord," +
+    "indexOfBoundary,touchedBounds,refineBoundary,wordGapBetween,nearestPointer,isWordChar,insideWord," +
     "snapStart,snapEnd,selectedSlice,linesFromChars,textOfChars,snapshot,NoteHistory," +
     "annotationItems,compareOrder,findAnnotation,annotationTarget,flashing,flashElapsed,pdfInnerOf,AnnotationsView," +
     "searchWords,wordMatches,editDistance,matchesQuery,destPoint,footnoteRegion," +
-    "resolveBookPath,drmProtected,snapOffset,findQuote,validTextSize,readZip," +
+    "resolveBookPath,drmProtected,snapOffset,findQuote,validTextSize,readZip,uprightPage,findQuoteAcross," +
     "validZoom,pdfViewerOf,pruneZooms,placeBox,clampToViewport};\n",
   P
 );
@@ -277,6 +277,31 @@ eq("a pointer already at the boundary leaves it alone", T.refineBoundary(LINE1, 
 eq("a pointer on another line is ignored", T.refineBoundary(LINE1, 22, { x: xOf(10), y: 900 }), 22);
 eq("no pointer, no change", T.refineBoundary(LINE1, 22, null), 22);
 eq("the nudge reaches only a few characters", T.refineBoundary(LINE1, 22, { x: xOf(2), y: 506 }), 18);
+
+/* KNOWN-ISSUES 3: a full stop taken because the pointer was a hair nearer the
+   boundary after it than the one before. */
+eq("a pointer barely nearer the boundary after a full stop leaves it out", T.refineBoundary(LINE1, 22, { x: xOf(22) + 3.6, y: 506 }), 22);
+eq("one clearly past it still takes it", T.refineBoundary(LINE1, 22, { x: xOf(23) - 0.5, y: 506 }), 23);
+{
+  /* Two lines; the browser's boundary at the start of the second. */
+  const two = chars([["first", 100, 500], ["second", 100, 520]]);
+  eq("a drag ending at the very start of a line keeps that line's first letter", T.refineBoundary(two, 5, { x: 100.5, y: 526 }), 5);
+  eq("and one a letter in still moves by that letter", T.refineBoundary(two, 5, { x: 107, y: 526 }), 6);
+}
+
+/* KNOWN-ISSUES 2: a drag begun in the space before a word reached back into
+   the word before it, which snapping then took whole. */
+eq("a boundary after a space is not moved back across it", T.refineBoundary(LINE1, 12, { x: xOf(10) + 1, y: 506 }), 12);
+eq("nor one before a space forward across it", T.refineBoundary(LINE1, 8, { x: xOf(10), y: 506 }), 8);
+eq("a space is a gap between words", T.wordGapBetween(LINE1, 12, 10), true);
+eq("letters of one word are not", T.wordGapBetween(LINE1, 18, 22), false);
+{
+  /* Two spans with no space character between them, set apart on the line. */
+  const nodeA = { nodeType: 3 }, nodeB = { nodeType: 3 };
+  const spans = chars([["of", 100, 500, nodeA], ["loneliness", 120, 500, nodeB]]);
+  eq("the visible gap between two spans is a gap between words", T.wordGapBetween(spans, 1, 3), true);
+  eq("two spans that touch are not", T.wordGapBetween(chars([["of", 100, 500, nodeA], ["ten", 114, 500, nodeB]]), 1, 3), false);
+}
 
 console.log("\n--- nearestPointer");
 {
@@ -500,6 +525,25 @@ eq(
   T.dropRunningHeads([ln(0), ln(60), ln(120), ln(180), ln(240), ln(300)]).length,
   2
 );
+/* KNOWN-ISSUES 4: a publisher's stamp in the corner, two lines close
+   together, tiny and out in the margin, drawn last in the content stream. */
+const body = (top) => ({ left: 60, top, width: 480, height: 12, text: "body" });
+const stamp = [
+  { left: 5, top: 10, width: 30, height: 4, text: "777309" },
+  { left: 5, top: 16, width: 40, height: 3, text: "research-article 2018" },
+];
+eq("a stamp of two small lines in the corner goes",
+  T.dropRunningHeads([body(600), body(614), body(628), ...stamp]).map((l) => l.text), ["body", "body", "body"]);
+eq("so do smaller lines that lie out in the margin",
+  T.dropRunningHeads([body(600), body(614), body(628), { left: 5, top: 10, width: 40, height: 7, text: "x" }, { left: 5, top: 20, width: 40, height: 7, text: "y" }]).length, 3);
+eq("and so do lines of ordinary size out there, as the stamp's first line is",
+  T.dropRunningHeads([body(600), body(614), body(628), { left: 5, top: 10, width: 40, height: 12, text: "x" }, { left: 5, top: 26, width: 40, height: 3, text: "y" }]).length, 3);
+eq("and footnotes in smaller type, below the body and within its span, stay",
+  T.dropRunningHeads([body(100), body(114), body(128), body(142), { left: 60, top: 700, width: 400, height: 7, text: "1 note" }, { left: 60, top: 709, width: 300, height: 7, text: "2 note" }]).length, 6);
+eq("but two full lines of body text at the top of a column stay",
+  T.dropRunningHeads([body(600), body(614), body(628), body(100), body(114)]).length, 5);
+eq("and so do two small lines within the body's span that are not apart from it",
+  T.dropRunningHeads([body(100), body(114), body(128), { left: 60, top: 142, width: 100, height: 5, text: "small" }]).length, 4);
 eq("too few lines to judge, so none are dropped", T.dropRunningHeads([ln(0), ln(600)]).length, 2);
 eq("a single line is never dropped", T.dropRunningHeads([ln(100)]).length, 1);
 eq("nor is an empty list disturbed", T.dropRunningHeads([]), []);
@@ -2063,6 +2107,50 @@ console.log("\n--- clampToViewport");
     eq("something that is not a zip is refused", threw, true);
   }
 
+  console.log("\n--- a page turned on its side");
+  {
+    /* Shown turned by 90 degrees: on screen 792 wide and 612 high, and a point
+       (x, y) of the page is at (y, x) on screen, measured down from the top. */
+    const turned = { width: 792, height: 612, convertToViewportPoint: (x, y) => [y, x] };
+    const view = [0, 0, 612, 792];
+    const note = { str: "1 Jones", width: 200, height: 9, transform: [0, 9, -9, 0, 560, 72] };
+    const up = T.uprightPage(turned, [note], { x: 548, y: 72 }, view);
+    eq("the page is measured as it appears", up.view, [0, 0, 792, 612]);
+    eq("its text is placed where it appears, measured up from the foot", up.items[0].transform.slice(4), [72, 52]);
+    eq("and so is the place linked to", up.point, { x: 72, y: 64 });
+    const region = T.footnoteRegion(up.items, up.view, up.point, 0);
+    eq("the footnote's line is found there", region.text, "1 Jones");
+    eq("starting at its top", region.top, 52 + 9 + 2);
+    eq("a link that gives only the height on screen keeps it", T.uprightPage(turned, [], { x: 548, y: null }, view).point, { x: null, y: 64 });
+    eq("and one that gives only the side leaves the height open", T.uprightPage(turned, [], { x: null, y: 72 }, view).point, { x: 72, y: null });
+    const upright = { width: 612, height: 792, convertToViewportPoint: (x, y) => [x, 792 - y] };
+    eq("an upright page is left as it is", T.uprightPage(upright, [note], { x: 72, y: 112 }, view).point, { x: 72, y: 112 });
+  }
+
+  console.log("\n--- a book highlight over a chapter break");
+  {
+    const texts = ["abc end of one\n", "Start of two xyz", "three"];
+    eq("found across the break, with each end in its own chapter", T.findQuoteAcross(texts, 0, 1, "of one Start of", 0), { start: [0, 8], end: [1, 8] });
+    eq("an end on the break belongs to the chapter before", T.findQuoteAcross(texts, 0, 1, "end of one", 0), { start: [0, 4], end: [0, 14] });
+    eq("only the chapters it spanned are searched", T.findQuoteAcross(texts, 0, 1, "three", 0), null);
+    eq("chapters past the end of the book are ignored", T.findQuoteAcross(texts, 1, 9, "three", 0), { start: [2, 0], end: [2, 5] });
+  }
+
+
+  console.log("\n--- an annotations file that has just gone");
+  {
+    const plugin = Object.create(PluginClass.prototype);
+    const gone = Object.assign(new TFile(), { path: "refs/paper.annotations.json" });
+    plugin.app = { vault: { getAbstractFileByPath: () => gone, read: async () => { const e = new Error("no such file"); e.code = "ENOENT"; throw e; } } };
+    plugin.report = () => { plugin.reported = true; };
+    const result = await plugin.readSidecar(Object.assign(new TFile(), { path: "refs/paper.pdf" }));
+    eq("is a fresh start, not a damaged file", result, { data: { highlights: [], notes: [] }, ok: true });
+    eq("and nothing is reported", !!plugin.reported, false);
+    plugin.app.vault.read = async () => "{ not json";
+    notices.length = 0;
+    const damaged = await plugin.readSidecar(Object.assign(new TFile(), { path: "refs/paper.pdf" }));
+    eq("while a damaged one is still kept read-only", damaged.ok, false);
+  }
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })();

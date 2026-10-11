@@ -176,39 +176,54 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     this.registerEvent(this.app.workspace.on('file-open', () => this.scheduleSync()));
     this.app.workspace.onLayoutReady(() => this.scheduleSync());
 
-    /* Document-level handlers, so events are caught however Obsidian's PDF
-       viewer wires its own listeners. Each one works out which PDF view the
-       event happened in, if any. mouseup bubbles, so the browser has settled
-       the text selection by the time it is read; click and contextmenu are
-       captured so nothing swallows them first. */
-    this.registerDomEvent(document, 'keydown', (e) => this.onKeyDown(e), true);
-    this.registerDomEvent(document, 'mousedown', (e) => this.onMouseDown(e));
-    this.registerDomEvent(document, 'mouseup', (e) => this.onMouseUp(e));
-    this.registerDomEvent(document, 'click', (e) => this.onClick(e), true);
-    this.registerDomEvent(document, 'contextmenu', (e) => this.onContextMenu(e), true);
-
-    /* Footnote and endnote previews. Anything that moves the page, or any
-       click outside the preview, puts it away. */
     this.footnotes = new FootnotePreview(this);
     this.selectionBar = new SelectionBar(this);
-    this.registerDomEvent(document, 'mousedown', (e) => {
+    /* Every window: the main one, any pop-out already open, and each one
+       opened from now on. */
+    this.windows = new Set();
+    this.listenTo(document);
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      const doc = leaf.view && leaf.view.containerEl && leaf.view.containerEl.ownerDocument;
+      if (doc) this.listenTo(doc);
+    });
+    this.registerEvent(this.app.workspace.on('window-open', (_workspaceWindow, win) => this.listenTo(win.document)));
+    this.registerEvent(this.app.workspace.on('window-close', (_workspaceWindow, win) => this.windows.delete(win.document)));
+  }
+
+  /* Document-level handlers, so events are caught however Obsidian's PDF
+     viewer wires its own listeners. Each one works out which view the event
+     happened in, if any. mouseup bubbles, so the browser has settled the text
+     selection by the time it is read; click and contextmenu are captured so
+     nothing swallows them first. A pop-out window is a document of its own,
+     so each one gets its own set. */
+  listenTo(doc) {
+    if (!doc || this.windows.has(doc)) return;
+    this.windows.add(doc);
+    this.registerDomEvent(doc, 'keydown', (e) => this.onKeyDown(e), true);
+    this.registerDomEvent(doc, 'mousedown', (e) => this.onMouseDown(e));
+    this.registerDomEvent(doc, 'mouseup', (e) => this.onMouseUp(e));
+    this.registerDomEvent(doc, 'click', (e) => this.onClick(e), true);
+    this.registerDomEvent(doc, 'contextmenu', (e) => this.onContextMenu(e), true);
+
+    /* The selection bar and footnote previews: anything that moves the page,
+       or any click outside them, puts them away. */
+    this.registerDomEvent(doc, 'mousedown', (e) => {
       if (!this.selectionBar.contains(e.target)) this.selectionBar.hide();
+      this.footnotes.pressed(e);
     }, true);
-    this.registerDomEvent(document, 'wheel', () => this.selectionBar.hide(), { capture: true, passive: true });
-    this.registerDomEvent(document, 'keydown', () => this.selectionBar.hide(), true);
-    this.registerDomEvent(document, 'mouseover', (e) => this.footnotes.over(e));
-    this.registerDomEvent(document, 'mouseout', (e) => this.footnotes.out(e));
-    this.registerDomEvent(document, 'wheel', () => this.footnotes.hide(), { capture: true, passive: true });
-    this.registerDomEvent(
-      document,
-      'keydown',
-      (e) => {
-        /* Not for a modifier on its own: Cmd is the start of Cmd+Z. */
-        if (!['Shift', 'Meta', 'Control', 'Alt'].includes(e.key)) this.footnotes.hide();
-      },
-      true
-    );
-    this.registerDomEvent(document, 'mousedown', (e) => this.footnotes.pressed(e), true);
+    this.registerDomEvent(doc, 'wheel', () => {
+      this.selectionBar.hide();
+      this.footnotes.hide();
+    }, { capture: true, passive: true });
+    this.registerDomEvent(doc, 'keydown', (e) => {
+      this.selectionBar.hide();
+      /* Not for a modifier on its own: Cmd is the start of Cmd+Z. */
+      if (!['Shift', 'Meta', 'Control', 'Alt'].includes(e.key)) this.footnotes.hide();
+    }, true);
+    this.registerDomEvent(doc, 'mouseover', (e) => this.footnotes.over(e));
+    this.registerDomEvent(doc, 'mouseout', (e) => this.footnotes.out(e));
+    this.applyModeColor();
+    doc.body.toggleClass('mpa-mode-active', this.highlightMode);
   }
 
   onunload() {
@@ -222,8 +237,10 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
       doc.saveTimer = null;
       this.queueSave(doc);
     }
-    document.body.removeClass('mpa-mode-active');
-    document.body.style.removeProperty('--mpa-mode-color');
+    for (const doc of this.windows || [document]) {
+      doc.body.removeClass('mpa-mode-active');
+      doc.body.style.removeProperty('--mpa-mode-color');
+    }
     for (const view of Array.from(this.views.keys())) this.teardownView(view);
     this.views.clear();
     this.docs.clear();
@@ -238,13 +255,13 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
   /* ----------------------------------------------------------------- modes */
 
   applyModeColor() {
-    document.body.style.setProperty('--mpa-mode-color', this.settings.highlightColor);
+    for (const doc of this.windows || [document]) doc.body.style.setProperty('--mpa-mode-color', this.settings.highlightColor);
   }
 
   toggleHighlightMode() {
     if (this.selectionBar) this.selectionBar.hide();
     this.highlightMode = !this.highlightMode;
-    document.body.toggleClass('mpa-mode-active', this.highlightMode);
+    for (const doc of this.windows || [document]) doc.body.toggleClass('mpa-mode-active', this.highlightMode);
     if (this.ribbonEl) this.ribbonEl.toggleClass('mpa-ribbon-active', this.highlightMode);
     this.updateStatusEl();
     /* Every viewer's toolbar button shows the mode, whichever control was
@@ -542,8 +559,18 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     const file = this.app.vault.getAbstractFileByPath(path);
     const empty = { highlights: [], notes: [] };
     if (!(file instanceof TFile)) return { data: empty, ok: true };
+    let text;
     try {
-      const parsed = JSON.parse(await this.app.vault.read(file));
+      text = await this.app.vault.read(file);
+    } catch (e) {
+      /* Gone from the disk before Obsidian noticed, by a sync for instance:
+         there are no annotations to protect, so this is a fresh start rather
+         than a damaged file. */
+      if (e && e.code === 'ENOENT') return { data: empty, ok: true };
+      throw e;
+    }
+    try {
+      const parsed = JSON.parse(text);
       const highlights = Array.isArray(parsed.highlights) ? parsed.highlights : [];
       return {
         ok: true,
@@ -634,7 +661,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
   /* The view an event landed in, plus whichever of our own elements it hit. */
   locate(e) {
     const target = e.target;
-    if (!(target instanceof Element)) return null;
+    if (!isElement(target)) return null;
     for (const state of this.views.values()) {
       if (!state.doc || !state.container.contains(target)) continue;
       this.recentView = state.view;
@@ -685,7 +712,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     if (!undo && !redo) return;
 
     const target = e.target;
-    if (target instanceof Element) {
+    if (isElement(target)) {
       /* A note box undoes the words in it, not the annotation around it, and
          does so through its own history rather than the browser's, which
          steps one character at a time. */
@@ -738,11 +765,15 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
        has settled the selection, which a double-click finishes later. */
     const state = hit.state;
     window.setTimeout(() => {
-      const selection = window.getSelection();
+      const selection = windowOf(state.container).getSelection();
       if (!selection || selection.isCollapsed || !selection.rangeCount) return;
       const range = selection.getRangeAt(0);
       if (!state.container.contains(range.commonAncestorContainer)) return;
-      this.selectionBar.show(selectionEnd(range), this.selectionActions(state.doc, () => this.addHighlightsFromSelection(state), () => selection.toString()));
+      this.selectionBar.show(
+        selectionEnd(range),
+        this.selectionActions(state.doc, () => this.addHighlightsFromSelection(state), () => selection.toString()),
+        state.container.ownerDocument
+      );
     }, 0);
   }
 
@@ -806,7 +837,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     this.selectionBar.hide();
 
     /* Text selected in this document: offer to highlight it. */
-    const selection = window.getSelection();
+    const selection = windowOf(state.container).getSelection();
     if (
       selection &&
       !selection.isCollapsed &&
@@ -914,7 +945,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
   /* The PDF these commands act on: the one with keyboard focus, or failing
      that the one last interacted with, as long as it is still on screen. */
   activeDoc() {
-    const focused = document.activeElement;
+    const focused = (typeof activeDocument !== 'undefined' ? activeDocument : document).activeElement;
     for (const state of this.views.values()) {
       if (focused && state.container.contains(focused)) return state.doc;
     }
@@ -984,7 +1015,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
   /* ------------------------------------------------------------ highlights */
 
   addHighlightsFromSelection(state) {
-    const selection = window.getSelection();
+    const selection = windowOf(state.container).getSelection();
     if (!selection || selection.isCollapsed || selection.rangeCount === 0) return;
     const range = selection.getRangeAt(0);
 
@@ -1064,7 +1095,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
      which differs between files and cannot be guessed at from the outside.
      When a highlight comes out wrong, this is what says why. */
   async writeSelectionReport() {
-    const selection = window.getSelection();
+    const selection = (typeof activeWindow !== 'undefined' ? activeWindow : window).getSelection();
     if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
       new Notice('Select some text in a PDF first.');
       return;
@@ -1239,7 +1270,9 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     if (this.sidebarOffered) return;
     this.sidebarOffered = true;
     if (this.app.workspace.getLeavesOfType(SIDEBAR_VIEW_TYPE).length) return;
-    this.ensureSidebar(true).catch((e) => this.report('could not open the sidebar', e));
+    /* On a phone or tablet the sidebar is a drawer that covers the document,
+       so it is made ready but left closed: it is a swipe away. */
+    this.ensureSidebar(!Platform.isMobile).catch((e) => this.report('could not open the sidebar', e));
   }
 
   /* Clicking a highlight or note marker in the document: its card, with the
@@ -1273,6 +1306,11 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
   navigateTo(doc, id) {
     const state = doc && this.viewForDoc(doc);
     if (!state) return false;
+    /* On a phone or tablet the sidebar's drawer covers the document, so it
+       closes to show where the card led. */
+    if (Platform.isMobile && this.app.workspace.rightSplit && !this.app.workspace.rightSplit.collapsed) {
+      this.app.workspace.rightSplit.collapse();
+    }
     if (state.kind === 'epub') {
       if (!state.container.isShown()) this.app.workspace.revealLeaf(state.view.leaf);
       if (!state.view.goTo(id)) return false;
@@ -1804,7 +1842,7 @@ class EpubView extends FileView {
   applyTheme() {
     const d = this.frame && this.frame.contentDocument;
     if (!d) return;
-    const css = getComputedStyle(document.body);
+    const css = getComputedStyle(this.containerEl.ownerDocument.body);
     const v = (name, fallback) => css.getPropertyValue(name).trim() || fallback;
     d.getElementById('mpa-epub-base').textContent = EPUB_BASE_CSS.replace(/\{\{([a-z-]+)\|([^}]*)\}\}/g, (_, name, fallback) =>
       v(`--${name}`, fallback)
@@ -1891,8 +1929,9 @@ class EpubView extends FileView {
     if (!range || !sameWords(range.toString(), highlight.text)) {
       /* The offsets have drifted, from a changed book perhaps: the words are
          looked for in the same chapter, nearest where they were. */
-      const found = findQuote(this.sectionText(anchor.start[0]), highlight.text || '', anchor.start[1]);
-      range = found ? this.rangeBetween([anchor.start[0], found.start], [anchor.start[0], found.end]) : null;
+      const texts = this.sections.map((_, i) => this.sectionText(i));
+      const found = findQuoteAcross(texts, anchor.start[0], anchor.end[0], highlight.text || '', anchor.start[1]);
+      range = found ? this.rangeBetween(found.start, found.end) : null;
     }
     this.ranges.set(key, range);
     return range;
@@ -2066,7 +2105,7 @@ class EpubView extends FileView {
         bubbles: true,
         cancelable: true,
       });
-      document.body.dispatchEvent(copy);
+      this.containerEl.ownerDocument.body.dispatchEvent(copy);
       if (copy.defaultPrevented) e.preventDefault();
     }, true);
     d.addEventListener('mousedown', (e) => {
@@ -2128,7 +2167,7 @@ class EpubView extends FileView {
     if (from && Math.hypot(e.clientX - from.x, e.clientY - from.y) > 3) return;
     /* Every link is handled here, so the frame itself never navigates away
        from the book. */
-    const link = e.target instanceof this.frame.contentWindow.Element ? e.target.closest('a, area') : null;
+    const link = isElement(e.target) ? e.target.closest('a, area') : null;
     if (link) {
       e.preventDefault();
       this.followLink(link);
@@ -2244,7 +2283,8 @@ class EpubView extends FileView {
     const frameBox = this.frame.getBoundingClientRect();
     this.plugin.selectionBar.show(
       selectionEnd(selection.getRangeAt(0), frameBox),
-      this.plugin.selectionActions(doc, () => this.highlightSelection(doc), () => selection.toString())
+      this.plugin.selectionActions(doc, () => this.highlightSelection(doc), () => selection.toString()),
+      this.containerEl.ownerDocument
     );
   }
 
@@ -2306,7 +2346,7 @@ class EpubView extends FileView {
   onOver(e) {
     const win = this.frame.contentWindow;
     const t = e.target;
-    if (!(t instanceof win.Element)) return;
+    if (!isElement(t)) return;
     if (this.preview && this.preview.el && this.preview.el.contains(t)) {
       this.cancelHidePreview();
       return;
@@ -2325,7 +2365,7 @@ class EpubView extends FileView {
     if (!this.preview) return;
     const win = this.frame.contentWindow;
     const inside = (node) =>
-      node instanceof win.Node && (this.preview.link.contains(node) || (!!this.preview.el && this.preview.el.contains(node)));
+      isNode(node) && (this.preview.link.contains(node) || (!!this.preview.el && this.preview.el.contains(node)));
     if (!inside(e.target) || inside(e.relatedTarget)) return;
     this.cancelHidePreview();
     this.preview.hideTimer = window.setTimeout(() => this.hidePreview(), FOOTNOTE_GRACE);
@@ -2449,6 +2489,34 @@ function snapOffset(text, offset, side, snap) {
     if (snap) while (i < text.length && word(text[i - 1]) && word(text[i])) i++;
   }
   return i;
+}
+
+/* Finds a book highlight's words when its place no longer holds them, across
+   the chapters it ran over: the texts of those chapters are searched as one,
+   as the highlight's own text was taken from them, and the place found is
+   given back as [chapter, offset] at each end. */
+function findQuoteAcross(texts, first, last, quote, near) {
+  const from = Math.max(0, first);
+  const to = Math.min(texts.length - 1, last);
+  if (to < from) return null;
+  const starts = [];
+  let joined = '';
+  for (let i = from; i <= to; i++) {
+    starts.push(joined.length);
+    joined += texts[i] || '';
+  }
+  const found = findQuote(joined, quote, starts[0] + near);
+  if (!found) return null;
+  const at = (index) => {
+    for (let k = starts.length - 1; k >= 0; k--) {
+      if (starts[k] <= index) return [from + k, index - starts[k]];
+    }
+    return [from, index];
+  };
+  /* An end exactly on a chapter's start belongs to the end of the one before. */
+  const end = at(found.end);
+  if (end[1] === 0 && end[0] > from) end.splice(0, 2, end[0] - 1, (texts[end[0] - 1] || '').length);
+  return { start: at(found.start), end };
 }
 
 function sameWords(a, b) {
@@ -2840,7 +2908,7 @@ class FootnotePreview {
 
   over(e) {
     const t = e.target;
-    if (!(t instanceof Element)) return;
+    if (!isElement(t)) return;
     if (this.el && this.el.contains(t)) {
       this.cancelHide();
       return;
@@ -2871,14 +2939,14 @@ class FootnotePreview {
   out(e) {
     if (!this.link) return;
     const inside = (node) =>
-      node instanceof Node && (this.link.contains(node) || (!!this.el && this.el.contains(node)));
+      isNode(node) && (this.link.contains(node) || (!!this.el && this.el.contains(node)));
     if (!inside(e.target) || inside(e.relatedTarget)) return;
     this.cancelHide();
     this.hideTimer = window.setTimeout(() => this.hide(), FOOTNOTE_GRACE);
   }
 
   pressed(e) {
-    if (this.el && e.target instanceof Node && this.el.contains(e.target)) return;
+    if (this.el && isNode(e.target) && this.el.contains(e.target)) return;
     this.hide();
   }
 
@@ -2956,21 +3024,19 @@ class FootnotePreview {
      wide as the preview. */
   async render(pdf, target, width, ratio) {
     const page = await pdf.getPage(target.pageIndex + 1);
-    /* A page turned on its side has its text column running down the
-       screen, which this way of cutting out a region does not handle. Such
-       a marker still jumps when clicked. */
-    if (page.rotate % 180) return null;
     const text = await page.getTextContent();
-    const region = footnoteRegion(text.items, page.view, target.point, width / FOOTNOTE_MAX_SCALE);
+    /* Worked out on the page as it appears on screen, so a page turned on
+       its side is cut the same way as any other. */
+    const base = page.getViewport({ scale: 1 });
+    const upright = uprightPage(base, text.items, target.point, page.view);
+    const region = footnoteRegion(upright.items, upright.view, upright.point, width / FOOTNOTE_MAX_SCALE);
     const scale = (width / (region.right - region.left)) * ratio;
     const viewport = page.getViewport({ scale });
-    const [x0, y0] = viewport.convertToViewportPoint(region.left, region.top);
-    const [x1, y1] = viewport.convertToViewportPoint(region.right, region.bottom);
-    const left = Math.min(x0, x1);
-    const top = Math.min(y0, y1);
+    const left = region.left * scale;
+    const top = (base.height - region.top) * scale;
     const canvas = createEl('canvas', { cls: 'mpa-footnote-picture' });
-    canvas.width = Math.max(1, Math.ceil(Math.abs(x1 - x0)));
-    canvas.height = Math.max(1, Math.ceil(Math.abs(y1 - y0)));
+    canvas.width = Math.max(1, Math.ceil((region.right - region.left) * scale));
+    canvas.height = Math.max(1, Math.ceil((region.top - region.bottom) * scale));
     canvas.style.width = `${canvas.width / ratio}px`;
     canvas.style.height = `${canvas.height / ratio}px`;
     const ctx = canvas.getContext('2d');
@@ -2996,9 +3062,11 @@ class SelectionBar {
   }
 
   /* anchor: the selection's last line, in the window's coordinates. */
-  show(anchor, actions) {
+  show(anchor, actions, doc) {
     this.hide();
-    const el = document.body.createDiv({ cls: 'mpa-selection-bar' });
+    const home = doc || document;
+    const win = home.defaultView || window;
+    const el = home.body.createDiv({ cls: 'mpa-selection-bar' });
     const button = (icon, label, run) => {
       const b = el.createEl('button', { cls: 'mpa-selection-button', attr: { 'aria-label': label } });
       setIcon(b.createSpan({ cls: 'mpa-selection-icon' }), icon);
@@ -3020,7 +3088,7 @@ class SelectionBar {
     const at = placeBox(
       { left: anchor.right - el.offsetWidth / 2, top: anchor.top, bottom: anchor.bottom },
       { width: el.offsetWidth, height: el.offsetHeight },
-      { width: window.innerWidth, height: window.innerHeight }
+      { width: win.innerWidth, height: win.innerHeight }
     );
     el.style.left = `${at.left}px`;
     el.style.top = `${at.top}px`;
@@ -3033,8 +3101,24 @@ class SelectionBar {
   }
 
   contains(node) {
-    return !!this.el && node instanceof Node && this.el.contains(node);
+    return !!this.el && isNode(node) && this.el.contains(node);
   }
+}
+
+/* Element and node checks that hold in every window. Each window, pop-outs
+   and a book's frame included, has its own Element and Node, so an element
+   made in one fails `instanceof` against another's. */
+function isElement(x) {
+  return !!x && typeof x.closest === 'function';
+}
+
+function isNode(x) {
+  return !!x && typeof x.nodeType === 'number';
+}
+
+/* The window an element is in: the main one, or a pop-out. */
+function windowOf(el) {
+  return (el && el.ownerDocument && el.ownerDocument.defaultView) || window;
 }
 
 /* Whether a point, in the coordinates of the range's own window, lies on the
@@ -3195,7 +3279,7 @@ class AnnotationsView extends ItemView {
     for (const card of this.cards.values()) {
       const keep =
         !this.searching() ||
-        document.activeElement === card.note ||
+        card.note.ownerDocument.activeElement === card.note ||
         matchesQuery(`${card.quoteText || ''}\n${card.note.value}`, query);
       card.el.toggleClass('mpa-hidden', !keep);
       if (keep) shown++;
@@ -3355,7 +3439,7 @@ class AnnotationsView extends ItemView {
     /* Right-clicking a card offers what its ··· button does. Not inside the
        note box, which keeps its own menu for pasting and spelling. */
     el.addEventListener('contextmenu', (e) => {
-      if (e.target instanceof Element && e.target.closest('textarea')) return;
+      if (isElement(e.target) && e.target.closest('textarea')) return;
       e.preventDefault();
       this.select(card.id);
       this.openMenu(card, e);
@@ -3382,7 +3466,7 @@ class AnnotationsView extends ItemView {
     /* A note being typed is left alone: what is in the box is newer than
        anything this could put there. */
     const note = item.kind === 'highlight' ? item.obj.note || '' : item.obj.text || '';
-    if (document.activeElement !== card.note && card.note.value !== note) {
+    if (card.note.ownerDocument.activeElement !== card.note && card.note.value !== note) {
       card.note.value = note;
       this.fit(card.note);
     }
@@ -3828,6 +3912,10 @@ function touchedBounds(chars) {
 
 const BOUNDARY_WINDOW = 4;
 
+/* How much nearer, in pixels, another boundary must be than the browser's own
+   before it is preferred. */
+const REFINE_MARGIN = 1.5;
+
 /* Moves a boundary to whichever nearby one is actually closest to the pointer.
 
    The viewer stretches each span of text horizontally to match the document's
@@ -3840,13 +3928,35 @@ function refineBoundary(chars, index, point) {
   if (!point || index < 0) return index;
   const lo = Math.max(0, index - BOUNDARY_WINDOW);
   const hi = Math.min(chars.length, index + BOUNDARY_WINDOW);
-
-  let best = index;
-  let bestDistance = Infinity;
-  for (let i = lo; i <= hi; i++) {
+  const onLine = (at) => !!at && point.y >= at.top - 2 && point.y <= at.bottom + 2;
+  /* Where boundary i is on the pointer's line. Between two lines it is two
+     places, the end of one line and the start of the next; the one on the
+     pointer's line is the one that counts. */
+  const position = (i) => {
     const at = boundaryPosition(chars, i);
+    if (onLine(at)) return at;
+    const next = i < chars.length ? chars[i] : null;
+    if (next && next.box) {
+      const start = { x: next.box.left, top: next.box.top, bottom: next.box.bottom };
+      if (onLine(start)) return start;
+    }
+    return null;
+  };
+
+  /* The browser's own answer stands unless another boundary is clearly
+     nearer the pointer, by more than REFINE_MARGIN: a pointer released a
+     hair past a full stop no longer takes it. */
+  const own = position(index);
+  let best = index;
+  let bestDistance = onLine(own) ? Math.abs(own.x - point.x) - REFINE_MARGIN : Infinity;
+  for (let i = lo; i <= hi; i++) {
+    if (i === index) continue;
+    const at = position(i);
     /* Only boundaries on the pointer's own line are candidates. */
-    if (!at || point.y < at.top - 2 || point.y > at.bottom + 2) continue;
+    if (!at) continue;
+    /* Never across a gap between words: a drag begun in the space before a
+       word must not reach back into the word before it. */
+    if (wordGapBetween(chars, index, i)) continue;
     const distance = Math.abs(at.x - point.x);
     if (distance < bestDistance) {
       bestDistance = distance;
@@ -3854,6 +3964,26 @@ function refineBoundary(chars, index, point) {
     }
   }
   return best;
+}
+
+/* Whether moving a boundary from a to b would cross a gap between words:
+   a space character, or the visible gap between two spans that a PDF leaves
+   in place of one (the same test textOfChars uses to put a space back). */
+function wordGapBetween(chars, a, b) {
+  const lo = Math.min(a, b);
+  const hi = Math.max(a, b);
+  for (let i = lo; i < hi; i++) {
+    const char = chars[i];
+    if (char && /\s/.test(char.ch)) return true;
+    if (i > lo && spanGap(chars[i - 1], char)) return true;
+  }
+  return false;
+}
+
+function spanGap(previous, char) {
+  if (!previous || !char || previous.node === char.node || !previous.box || !char.box) return false;
+  const height = Math.min(previous.box.bottom - previous.box.top, char.box.bottom - char.box.top);
+  return char.box.left - previous.box.right > Math.max(1, height * 0.2);
 }
 
 /* Which of the drag's two ends to judge a boundary against. A drag made
@@ -4074,6 +4204,37 @@ function dropRunningHeads(lines) {
   for (let n = 0; n < 2 && hi - lo >= 2; n++) {
     if (!detached(sorted[hi - 1], sorted[hi])) break;
     drop.add(sorted[hi--]);
+  }
+
+  /* A small group at either extreme that stands apart from the rest and is
+     plainly not body text: every line in it far smaller than the body's, or
+     lying wholly outside the body's span across the page. This is a
+     publisher's stamp in a corner, which comes as two lines close together,
+     so the single-line rule above lets it through. The top of a second
+     column is neither small nor outside the body, so it stays. */
+  const rest = sorted.slice(lo, hi + 1);
+  const median = heights[heights.length >> 1];
+  /* Tiny, or lying wholly out in the margin. Footnotes set in smaller type,
+     often about 60% of the body's size, sit within the body's span, so a
+     selection that reaches them keeps them. */
+  const marginal = (line, body) => {
+    if (line.height < median * 0.4) return true;
+    if (line.left === null || line.width === null || !body.length) return false;
+    const left = Math.min(...body.map((l) => l.left));
+    const right = Math.max(...body.map((l) => l.left + l.width));
+    return line.left + line.width <= left + 1 || line.left >= right - 1;
+  };
+  for (const fromTop of [true, false]) {
+    for (let size = 2; size >= 1; size--) {
+      if (rest.length - size < 3) continue;
+      const group = fromTop ? rest.slice(0, size) : rest.slice(rest.length - size);
+      const body = fromTop ? rest.slice(size) : rest.slice(0, rest.length - size);
+      const edge = fromTop ? detached(group[group.length - 1], body[0]) : detached(body[body.length - 1], group[0]);
+      if (!edge || !group.every((line) => marginal(line, body))) continue;
+      for (const line of group) drop.add(line);
+      rest.splice(fromTop ? 0 : rest.length - size, size);
+      break;
+    }
   }
 
   return drop.size ? lines.filter((line) => !drop.has(line)) : lines;
@@ -4322,6 +4483,36 @@ function headerButtons(view, act) {
   const zoomIn = view.addAction('zoom-in', 'Zoom in', act.zoomIn);
   const zoomOut = view.addAction('zoom-out', 'Zoom out', act.zoomOut);
   return { mode, zoomIn, zoomOut };
+}
+
+/* A page's text and a link's target, moved into the page as it appears on
+   screen at scale 1, measured up from its bottom-left corner as a PDF is. On
+   an upright page this changes nothing that matters; on a page turned on its
+   side, it is what lets footnoteRegion find the text column, which then runs
+   across the screen as it does on any other page. */
+function uprightPage(viewport, items, point, view) {
+  const toScreen = (x, y) => viewport.convertToViewportPoint(x, y);
+  const height = viewport.height;
+  const moved = [];
+  for (const it of items || []) {
+    if (!Array.isArray(it.transform)) continue;
+    const [sx, sy] = toScreen(it.transform[4], it.transform[5]);
+    moved.push(Object.assign({}, it, { transform: [it.transform[0], it.transform[1], it.transform[2], it.transform[3], sx, height - sy] }));
+  }
+  /* A coordinate the link leaves open stays open on screen too: if the
+     screen's height depends on it, the preview starts at the top. */
+  const screen = (x, y) => {
+    const [sx, sy] = toScreen(x, y);
+    return { x: sx, y: height - sy };
+  };
+  const px = point && point.x !== null && point.x !== undefined ? point.x : null;
+  const py = point && point.y !== null && point.y !== undefined ? point.y : null;
+  const at = screen(px !== null ? px : view[0], py !== null ? py : view[3]);
+  const heightFromX = Math.abs(screen(view[0], view[1]).y - screen(view[2], view[1]).y) > 1;
+  const decidesHeight = heightFromX ? px : py;
+  const decidesWidth = heightFromX ? py : px;
+  const target = { x: decidesWidth !== null ? at.x : null, y: decidesHeight !== null ? at.y : null };
+  return { items: moved, point: target, view: [0, 0, viewport.width, height] };
 }
 
 function pdfInnerOf(view) {

@@ -1,104 +1,77 @@
 # Known issues
 
-Open problems in selection accuracy, parked on 9 October 2026 to be picked up
-in a later session. Everything here is about where a highlight's two boundaries
-land, which is the hardest part of this plugin. Large highlights, undo and
-the rest are behaving.
+Where a highlight's two ends land in a PDF is the hardest part of this plugin.
+Four problems with it were parked on 9 October 2026 and worked on on 11
+October. Here is where each one stands.
 
-Reproduce any of these with the command **Report what the current selection
-looks like**, which writes `Minimal PDF annotator selection report.md` at the
-vault root. It lists the character array the highlight is cut from, both
-boundaries, the characters either side of each, and where the browser had put
-them before the pointer was consulted.
+To diagnose a highlight that comes out wrong, the plugin keeps a report it can
+write about the current selection: the character array the highlight is cut
+from, both ends, the characters either side of each, and where the browser had
+put them before the pointer was consulted. It is no longer a command; run it
+from the developer console (Cmd+Option+I) with the problem text selected:
 
-## 1. One sentence resists everything
+```js
+app.plugins.plugins['minimal-pdf-annotator'].writeSelectionReport()
+```
 
-The first sentence of `Groups and well-being/Loneliness in australian men.pdf`
-loses its final letter: "lonelines" for "loneliness". It survived the character
-model, pointer refinement and word snapping, and it is the only clause in that
-PDF that misbehaves. Turning snapping off fixes every other case but not this
-one.
+It writes `Minimal PDF annotator selection report.md` at the vault root.
 
-Because it is one clause in one file, the next step is to read a report for it
-specifically and compare the character array against the span structure the
-viewer built, rather than to change the boundary logic again. Suspect something
-particular to that span: a ligature, a soft hyphen, a marked-content boundary
-falling mid-word.
+## 1. One sentence lost its last letter: no longer happens
 
-## 2. Starting in the gap between words sometimes takes the word before
+The first sentence of the loneliness paper (`Loneliness in australian
+men.pdf`) used to lose its final letter: "lonelines" for "loneliness". On 11
+October it could not be made to happen. Drags ending at five different points
+on the last letter all kept the whole word. It was probably fixed along the
+way by the changes to how a selection's ends are measured. If it comes back, a
+selection report of that sentence is the place to start.
 
-One failure in six attempts. `insideWord()` is meant to prevent this: a
-boundary already sitting in whitespace is left alone. A failure means the
-boundary did not start in the whitespace, so pointer refinement moved it into
-the preceding word and snapping then completed that word.
+## 2. Starting in the gap between words sometimes took the word before: fixed in the logic
 
-The likely fix is to stop `refineBoundary()` crossing a whitespace character:
-if the browser's boundary is in a gap, candidates on the far side of that gap
-should not be considered. That is a small, testable change to the candidate
-window.
+The browser's idea of where a drag began can sit a letter away from the
+pointer, so the plugin moves each end to the letter boundary nearest the
+pointer. In the gap between two words, that could move the start back across
+the space into the word before, and snapping to whole words then took that
+word whole. A boundary is now never moved across a gap between words, whether
+a space character or the visible gap a PDF leaves between two runs of text.
 
-## 3. A full stop before a space is sometimes captured
+Unit tests cover the rule. In the window, 50 drags begun at different points
+in ten word gaps all came out right, but they did with the old code too, so
+the original failure (about one drag in six) could not be reproduced to show
+the fix working there.
 
-Same mechanism, the other direction. The pointer lands close enough to the
-boundary after the full stop that it wins. Tightening the refinement to prefer
-the browser's own boundary unless another is clearly closer, rather than merely
-closer, would help. A dead zone of a pixel or two, or a requirement that the
-winning boundary beat the browser's by some margin.
+## 3. A full stop was sometimes taken: fixed in the logic
 
-## 4. A selection across a page break can take a running header
+The same correction, at the other end. A drag released just past a word's last
+letter could be nearer the boundary after the full stop than the one before
+it, and take the full stop. The browser's own boundary now stands unless
+another one is nearer the pointer by more than a pixel and a half. As with 2,
+unit tests cover it, and the window could not reproduce the original failure.
 
-Left alone deliberately. A PDF may draw its running header at any point in its
-content stream rather than where it appears on the page, so a selection
-sweeping to the end of a page in reading order picks it up. Zotero has the same
-behaviour on the same file, which is a good sign that it is inherent rather
-than a defect here.
+## 4. A selection across a page break took a publisher's stamp: fixed
 
-The "boxes in the top-left corner" reported earlier are the same mechanism,
-diagnosed on 10 October 2026 with the real-window harness. In the loneliness
-paper they are the publisher's production stamp, "777309 research-article
-2018", printed tiny in page 1's top-left corner and drawn last in the content
-stream, so a selection running off the bottom of page 1 sweeps them in. They
-survive the filter below because they form two lines close to each other, and
-the filter only drops a line that stands alone. Dropping a detached group of
-two would fix this, but would also drop the first two lines of a second column
-in a two-column paper. A narrower test would be text lying entirely in the page
-margin, outside the horizontal span of the body lines, or text drawn at a
-near-zero height (two of the three stamp words are about a pixel tall). The
-harness reports this as a known issue rather than a failure.
+A PDF can draw text at any point in its content stream, not where it appears
+on the page. The loneliness paper draws a production stamp, "777309
+research-article 2018", tiny in page 1's top-left corner and last of all, so a
+selection running off the bottom of page 1 swept it in. A small group of lines
+standing apart from the rest of what was selected is now dropped when every
+line in it is either far smaller than the body text or lies outside the body
+text's span across the page. The top lines of a second column are neither, so
+two-column papers are unaffected. The window test that used to report this as
+a known issue now checks it.
 
-Whether the boxes are drawn depends on the zoom. Two of the three stamp words
-are about a pixel tall, and below half a pixel they are treated as having no
-position. That leaves "777309" on its own, which the filter then drops, so at
-small zooms the boxes disappear while the stamp's text is still swept into the
-highlight. The harness pins the zoom for this check so the result does not
-depend on how wide the sidebar leaves the page.
+A running header at the top of the next page can still be swept in when it is
+ordinary-sized text above the body, as it can be in Zotero. A line standing
+entirely on its own is dropped, as before.
 
-`dropRunningHeads()` catches the common case: a line standing far above or
-below everything else selected on that page is dropped. It is deliberately
-timid, because dropping real text would be worse than leaving a page number
-in, and a two-column paper has to survive it untouched.
+## Other limitations
+
+- **Mobile** has been checked only in Obsidian's mobile emulation on a
+  computer, not on a phone or tablet.
 
 ## Where the relevant code is
 
 In `main.js`, under the heading "the character model": `buildChars()`,
-`refineBoundary()`, `nearestPointer()`, `insideWord()`, `snapStart()`,
-`snapEnd()` and `selectedSlice()`. All of the pure ones are covered in
-`tests/test-markdown.js`, so a fix can be written against a test before being
-tried in the app.
-
-## Other limitations
-
-These aren't selection problems, but they are known and not yet handled.
-
-- **Pop-out windows.** The plugin listens for clicks, keys and hovers in
-  Obsidian's main window only. In a document moved to a pop-out window,
-  highlights are drawn but clicking them, the undo keys and footnote
-  previews do nothing.
-- **A PDF page turned on its side** gets no footnote preview. Its markers
-  still jump when clicked.
-- **A book highlight across two chapters**, whose place stops matching its
-  words after the book file changes, is not looked for again. It stays in the
-  sidebar but isn't drawn. A highlight within one chapter is found again.
-- **Dragging out of a book.** A selection that ends with the mouse released
-  outside the book's frame, over the sidebar say, may make no highlight.
-- **Mobile.** Nothing has been tried on Obsidian's mobile apps.
+`refineBoundary()`, `wordGapBetween()`, `nearestPointer()`, `insideWord()`,
+`snapStart()`, `snapEnd()`, `selectedSlice()` and `dropRunningHeads()`. All are
+covered in `tests/test-markdown.js`, so a fix can be written against a test
+before being tried in the app.

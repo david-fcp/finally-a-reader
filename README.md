@@ -14,11 +14,20 @@ For me, this replaces Zotero and Zotero-like plugins. Enjoy!
 
 ## Using it
 
-1. **Turn on highlight mode.** Use the highlighter icon in the ribbon, the
-   swatch in the status bar, the highlighter button in a PDF's toolbar or at
-   the top of a book, or the command **Toggle highlight mode**.
+1. **Turn on highlight mode.** Use the highlighter button at the top of a
+   PDF or a book, the highlighter icon in the ribbon, the swatch in the status
+   bar, or the command **Toggle highlight mode**.
 2. **Select text** in a PDF or an EPUB. It is highlighted as soon as you let
    go of the mouse, and appears in the sidebar.
+
+With highlight mode off, selecting text brings up a small bar beside it, as
+in Zotero: **Highlight**, **Add note** (highlights it and puts the cursor in
+its note) and **Copy**. It goes away when you click elsewhere, scroll or type.
+Right-clicking selected text offers Highlight too.
+
+PDFs and books look the same: the top of the tab holds the highlighter and
+zoom buttons, and nothing else. In a book, zooming changes the text size,
+which is remembered for each book.
 3. **Add a note** by typing in the "Add note" box under a highlight in the
    sidebar. Notes save as you type.
 
@@ -32,9 +41,9 @@ The sidebar opens by itself the first time you open a PDF or EPUB. The command
 - **Click a highlight's words in the sidebar** to go to it in the document.
 - **Right-click a bare part of the text** for "Add note", which makes a note of
   its own at that point.
-- **Delete** a highlight or note from the ··· menu on its card, or select the
-  card and press Delete. Right-clicking a highlight in the document offers the
-  same.
+- **Delete** a highlight or note by right-clicking its card, from the ···
+  menu on it, or by selecting the card and pressing Delete. Right-clicking a
+  highlight in the document offers the same.
 - **Hover over a footnote or endnote marker** to read the note without
   leaving your place. Click the marker, or the preview, to jump to it. This
   works for any link to somewhere else in the same document.
@@ -76,8 +85,7 @@ when you want an updated copy.
 
 EPUBs open in the plugin's own reader, as one continuous scroll through the
 whole book. Everything above works in them as it does in PDFs. The book uses
-your theme's colours and font unless it sets its own. **A+** and **A−** at the
-top change the text size, which is remembered for each book.
+your theme's colours and font unless it sets its own.
 
 Books with DRM, and fixed-layout books such as picture books and magazines,
 can't be opened; the reader says so. Nothing in a book can run: it is shown
@@ -113,9 +121,7 @@ box they undo your typing, a burst at a time, as the rest of Obsidian does.
 The keys can't be rebound. On the desktop, the editor's undo isn't an Obsidian
 command, and a plugin command bound to Cmd+Z would stop it working everywhere
 without the hotkey settings warning you. So the plugin catches the key itself,
-only for keystrokes that belong to a document it shows. The commands **Undo
-last annotation change** and **Redo last undone annotation change** are there
-for the command palette, or for a second key of your own.
+only for keystrokes that belong to a document it shows.
 
 The history goes fifty changes back per document, lives in memory, and is lost
 when Obsidian restarts. It is also cleared when the annotations file changes
@@ -143,10 +149,7 @@ recover.
   annotation tool, highlights may occasionally be mildly inaccurate, like
   capturing a full stop that you didn't highlight. This is annoying. Will try
   to improve in v1. The known cases are written up in
-  [KNOWN-ISSUES.md](KNOWN-ISSUES.md). If a highlight in a PDF comes out wrong,
-  select the same text and run the command **Report what the current selection
-  looks like**: it writes a note describing what the viewer saw, which is what
-  explains the result.
+  [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
 
 ## Wishlist
 
@@ -174,7 +177,13 @@ PDFs open in Obsidian's own PDF viewer, which the plugin works alongside. EPUBs
 open in the plugin's reader. If another plugin already opens EPUBs, only one
 of them can; disable the other to use this one for books.
 
-It has not been tried on Obsidian's mobile apps yet.
+Documents in pop-out windows work as they do in the main window.
+
+On phones and tablets the sidebar is a drawer, so it doesn't open by itself:
+open it from the right edge. Clicking a highlight still opens it at that
+highlight's note, and clicking a card closes it again to show the place. This
+has been checked in Obsidian's mobile emulation on a computer, not yet on a
+real phone or tablet.
 
 ## Tests
 
