@@ -2380,6 +2380,9 @@ class EpubView extends FileView {
     }, true);
     d.addEventListener('mousedown', (e) => {
       plugin.selectionBar.hide();
+      /* A click in the book is a click away from the card in hand; it never
+         reaches the window where that is otherwise noticed. */
+      for (const sidebar of plugin.sidebars()) sidebar.pressedElsewhere(e);
       this.pressedAt = { x: e.clientX, y: e.clientY };
       plugin.recentView = this;
       /* Clicking into the book makes it the document in front, as clicking

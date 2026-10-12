@@ -11,6 +11,11 @@ and then be able to instantly generate a markdown file containing all of those
 notes.
 
 For me, this replaces both Zotero AND my clunky or invasive EPUB readers. Enjoy!
+
+![Highlighting a sentence, then adding a note to it in the sidebar](assets/highlight.gif)
+
+![Making a markdown note of every annotation with one click](assets/note.gif)
+
 # Other features 
 - Search your annotations in the sidebar 
 - Undo and redo functionality (this is rare!)
