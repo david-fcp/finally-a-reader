@@ -1,11 +1,11 @@
 'use strict';
 
 /*
- * Minimal PDF annotator.
+ * Finally, A Reader.
  *
  * Select text in a PDF with highlight mode on and it is highlighted. The
  * annotations sidebar lists every highlight and note on the document in front
- * of you, after Zotero's: click a card's words to go to them, type in its
+ * of you: click a card's words to go to them, type in its
  * "Add note" box to annotate them, and click a highlight in the document to
  * land in its box. Right-click a bare part of a page for a note of its own.
  *
@@ -30,7 +30,13 @@ const {
 } = require('obsidian');
 
 const DEFAULT_SETTINGS = {
+  /* The colour highlight mode uses: always the first colour in the menu. */
   highlightColor: '#ffeb3b',
+  /* Highlight colours. Those in the menu are offered, in this order, when
+     text is selected or right-clicked; the spares wait in the settings until
+     moved into it. */
+  menuColours: ['#ffeb3b'],
+  spareColours: ['#a8e6a1', '#9fd3ff'],
   snapToWords: true,
   rememberZoom: true,
   /* 'position' or 'date'. */
@@ -41,7 +47,7 @@ const DEFAULT_SETTINGS = {
   noteLayout: 'indented-bullet',
   looseNoteLayout: 'bullets',
   /* macOS only: Look Up in the right-click menu. */
-  lookUp: true,
+  lookUp: false,
 };
 
 const HEX_COLOR_RE = /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
@@ -80,7 +86,7 @@ const EPUB_LINE_EMS = 44;
 /* Where each book was left, per device, as [chapter, offset]. */
 const PLACE_STORE_KEY = 'epub-place';
 
-class MinimalPdfAnnotatorPlugin extends Plugin {
+class FinallyAReaderPlugin extends Plugin {
   async onload() {
     await this.loadSettings();
 
@@ -166,7 +172,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
       },
     });
 
-    this.addSettingTab(new MinimalPdfAnnotatorSettingTab(this.app, this));
+    this.addSettingTab(new FinallyAReaderSettingTab(this.app, this));
     this.removeOldHelpFile().catch((e) => this.report('could not tidy away the old help file', e));
 
     this.registerEvent(
@@ -259,7 +265,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
   }
 
   report(what, error) {
-    const message = `Minimal PDF annotator: ${what}`;
+    const message = `Finally, A Reader: ${what}`;
     if (error === undefined) console.error(message);
     else console.error(message, error);
   }
@@ -814,7 +820,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
       if (!state.container.contains(range.commonAncestorContainer)) return;
       this.selectionBar.show(
         selectionEnd(range),
-        this.selectionActions(state.doc, () => this.addHighlightsFromSelection(state), () => selection.toString()),
+        this.selectionActions(state.doc, (c) => this.addHighlightsFromSelection(state, c), () => selection.toString()),
         state.container.ownerDocument
       );
     }, 0);
@@ -860,14 +866,19 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     }, 0);
   }
 
+  /* The colours offered for highlighting, first first. */
+  menuColours() {
+    return (this.settings && this.settings.menuColours) || [];
+  }
+
   /* What the selection bar and the right-click menu do with a selection, for
      either kind of document: `make` turns the selection into a highlight and
      returns its id. */
   selectionActions(doc, make, text) {
     const editable = !doc.readOnly;
-    const highlight = () => {
+    const highlight = (colour) => {
       if (!this.canEdit(doc)) return null;
-      const id = make();
+      const id = make(colour);
       if (id) this.showInSidebar(doc, id);
       return id;
     };
@@ -875,7 +886,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
       highlight: editable ? highlight : null,
       note: editable
         ? () => {
-            const id = highlight();
+            const id = highlight(this.menuColours()[0]);
             if (id) this.revealAnnotation(doc, id, true).catch((err) => this.report('could not show the note', err));
           }
         : null,
@@ -930,7 +941,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
       state.container.contains(selection.getRangeAt(0).commonAncestorContainer) &&
       pointInRange(selection.getRangeAt(0), e.clientX, e.clientY);
     if (onSelection) {
-      buttons.push(...selectionButtons(this.selectionActions(doc, () => this.addHighlightsFromSelection(state), () => selection.toString())));
+      buttons.push(...selectionButtons(this.selectionActions(doc, (c) => this.addHighlightsFromSelection(state, c), () => selection.toString()), this.menuColours()));
     } else if (iconKind === 'note') {
       /* A note of its own, by its marker. */
       if (!doc.readOnly) {
@@ -1068,7 +1079,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
 
   /* ------------------------------------------------------------ highlights */
 
-  addHighlightsFromSelection(state) {
+  addHighlightsFromSelection(state, colour) {
     const selection = windowOf(state.container).getSelection();
     if (!selection || selection.isCollapsed || selection.rangeCount === 0) return;
     const range = selection.getRangeAt(0);
@@ -1131,7 +1142,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
       rects,
       /* Recorded per highlight, so changing the setting later recolours
          nothing that already exists. */
-      color: this.settings.highlightColor,
+      color: HEX_COLOR_RE.test(colour || '') ? colour : this.settings.highlightColor,
       note: '',
       createdAt: new Date().toISOString(),
     });
@@ -1249,7 +1260,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     out.push('```');
     out.push('');
 
-    const path = 'Minimal PDF annotator selection report.md';
+    const path = 'Finally, A Reader selection report.md';
     const body = out.join('\n');
     const existing = this.app.vault.getAbstractFileByPath(path);
     if (existing instanceof TFile) await this.app.vault.modify(existing, body);
@@ -1317,7 +1328,7 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
   }
 
   /* The sidebar comes into view by itself the first time a PDF is opened in a
-     session, so it is there without being asked for, the way Zotero's is.
+     session, so it is there without being asked for.
      Only once: if it is closed after that, it stays closed until something
      needs it. */
   maybeOpenSidebar() {
@@ -1428,8 +1439,8 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
   }
 
   /* Right-clicking a bare part of a page. The note is made at once, empty,
-     and the cursor goes to its box in the sidebar. An empty note is kept, as
-     Zotero keeps one; it is removed from its card's menu. */
+     and the cursor goes to its box in the sidebar. An empty note is kept; it
+     is removed from its card's trash can. */
   addStandaloneNote(state, e, pageEl) {
     if (!this.canEdit(state.doc)) return;
     const box = pagePaddingBox(pageEl);
@@ -1591,9 +1602,13 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
     if (!HEX_COLOR_RE.test(this.settings.highlightColor)) {
       this.settings.highlightColor = DEFAULT_SETTINGS.highlightColor;
     }
+    const palette = normalisePalette(this.settings, DEFAULT_SETTINGS);
+    this.settings.menuColours = palette.menu;
+    this.settings.spareColours = palette.spare;
+    this.settings.highlightColor = palette.menu[0];
     this.settings.snapToWords = this.settings.snapToWords !== false;
     this.settings.rememberZoom = this.settings.rememberZoom !== false;
-    this.settings.lookUp = this.settings.lookUp !== false;
+    this.settings.lookUp = this.settings.lookUp === true;
     const valid = {
       quoteMarks: Object.keys(QUOTE_MARKS),
       highlightLayout: Object.keys(LAYOUT_SHAPES),
@@ -1628,10 +1643,131 @@ class MinimalPdfAnnotatorPlugin extends Plugin {
    nobody has edited. */
 const OLD_HELP_STAMPS = ['41f1859b-3282', 'a69ad533-3360'];
 
-class MinimalPdfAnnotatorSettingTab extends PluginSettingTab {
+class FinallyAReaderSettingTab extends PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
+  }
+
+  /* The highlight colours as a row of swatches with a line in it: the menu's
+     colours to its left, the spares to its right. Swatches are dragged to
+     reorder or to cross the line; a click changes a colour; the cross on a
+     spare removes it; the plus adds one. */
+  drawPalette(row) {
+    const plugin = this.plugin;
+    const settings = plugin.settings;
+    row.empty();
+    const commit = async (lists) => {
+      settings.menuColours = lists.menu;
+      settings.spareColours = lists.spare;
+      settings.highlightColor = lists.menu[0];
+      await plugin.saveSettings();
+      this.drawPalette(row);
+    };
+    /* Where a drop at x lands: before the first swatch whose middle is
+       right of x, counting the line as a place in the row. */
+    const dropTarget = (x) => {
+      const items = Array.from(row.querySelectorAll('.mpa-swatch, .mpa-palette-line'));
+      let menuIndex = 0;
+      let spareIndex = 0;
+      let pastLine = false;
+      for (const item of items) {
+        const box = item.getBoundingClientRect();
+        if (x < box.left + box.width / 2) break;
+        if (item.hasClass('mpa-palette-line')) pastLine = true;
+        else if (pastLine) spareIndex++;
+        else menuIndex++;
+      }
+      return pastLine ? { list: 'spare', index: spareIndex } : { list: 'menu', index: menuIndex };
+    };
+
+    const swatch = (colour, list, index) => {
+      const el = row.createDiv({ cls: 'mpa-swatch', attr: { draggable: 'true', 'aria-label': `${colourName(colour)}, ${colour}` } });
+      el.style.setProperty('--mpa-color', colour);
+      const input = el.createEl('input', { type: 'color', cls: 'mpa-swatch-input' });
+      input.value = expandHex(colour);
+      el.addEventListener('click', (e) => {
+        if (e.target === input || (isElement(e.target) && e.target.closest('.mpa-swatch-remove'))) return;
+        input.click();
+      });
+      input.addEventListener('change', () => {
+        const value = input.value.toLowerCase();
+        /* A colour already in the palette is not taken twice; the swatch
+           goes back to what it was. */
+        if (!HEX_COLOR_RE.test(value) || settings.menuColours.concat(settings.spareColours).includes(value)) {
+          this.drawPalette(row);
+          return;
+        }
+        const lists = { menu: settings.menuColours.slice(), spare: settings.spareColours.slice() };
+        lists[list][index] = value;
+        commit(lists);
+      });
+      if (list === 'spare') {
+        const remove = el.createDiv({ cls: 'mpa-swatch-remove', attr: { 'aria-label': 'Remove this colour' } });
+        setIcon(remove, 'x');
+        remove.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const spare = settings.spareColours.slice();
+          spare.splice(index, 1);
+          commit({ menu: settings.menuColours.slice(), spare });
+        });
+      }
+      el.addEventListener('dragstart', (e) => {
+        row.mpaDragging = { list, index };
+        el.addClass('is-dragging');
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', colour);
+      });
+      el.addEventListener('dragend', () => {
+        row.mpaDragging = null;
+        el.removeClass('is-dragging');
+        row.removeClass('is-drop-target');
+      });
+    };
+
+    settings.menuColours.forEach((c, i) => swatch(c, 'menu', i));
+    row.createDiv({ cls: 'mpa-palette-line', attr: { 'aria-label': 'Left of the line: in the right-click menu' } });
+    settings.spareColours.forEach((c, i) => swatch(c, 'spare', i));
+
+    const add = row.createDiv({ cls: 'mpa-palette-add clickable-icon', attr: { 'aria-label': 'Add a colour' } });
+    setIcon(add, 'plus');
+    const picker = add.createEl('input', { type: 'color', cls: 'mpa-swatch-input' });
+    picker.value = '#ffb3ba';
+    add.addEventListener('click', (e) => {
+      if (e.target !== picker) picker.click();
+    });
+    picker.addEventListener('change', () => {
+      const value = picker.value.toLowerCase();
+      if (!HEX_COLOR_RE.test(value) || settings.menuColours.concat(settings.spareColours).includes(value)) {
+        this.drawPalette(row);
+        return;
+      }
+      commit({ menu: settings.menuColours.slice(), spare: settings.spareColours.concat(value) });
+    });
+
+    /* The row's own listeners, added the first time only: drawing again
+       empties the row but keeps the row. */
+    row.mpaDrop = (e) => {
+      const from = row.mpaDragging;
+      row.mpaDragging = null;
+      const lists = movePaletteColour(settings.menuColours, settings.spareColours, from, dropTarget(e.clientX));
+      if (lists) commit(lists);
+      else this.drawPalette(row);
+    };
+    if (!row.mpaWired) {
+      row.mpaWired = true;
+      row.addEventListener('dragover', (e) => {
+        if (!row.mpaDragging) return;
+        e.preventDefault();
+        row.addClass('is-drop-target');
+      });
+      row.addEventListener('dragleave', () => row.removeClass('is-drop-target'));
+      row.addEventListener('drop', (e) => {
+        if (!row.mpaDragging) return;
+        e.preventDefault();
+        row.mpaDrop(e);
+      });
+    }
   }
 
   display() {
@@ -1652,15 +1788,15 @@ class MinimalPdfAnnotatorSettingTab extends PluginSettingTab {
       )
       .addToggle((toggle) => toggle.setValue(settings.snapToWords).onChange((v) => save('snapToWords', v)));
 
-    new Setting(containerEl)
-      .setName('Highlight colour')
-      .setDesc('Used for new highlights. Existing ones keep the colour they were made with.')
-      .addColorPicker((picker) =>
-        picker.setValue(settings.highlightColor).onChange(async (value) => {
-          if (!HEX_COLOR_RE.test(value)) return;
-          await save('highlightColor', value);
-        })
+    const palette = new Setting(containerEl)
+      .setName('Highlight colours')
+      .setDesc(
+        'Colours to the left of the line are in the right-click menu, in that order, and the first is the one ' +
+          'highlight mode uses. Drag a colour across the line to add it to the menu or take it out, or along ' +
+          'the row to reorder. Click a colour to change it. Existing highlights keep the colour they were made with.'
       );
+    palette.settingEl.addClass('mpa-palette-setting');
+    this.drawPalette(palette.controlEl.createDiv({ cls: 'mpa-palette' }));
 
     const choice = (name, key, options) =>
       new Setting(containerEl)
@@ -1697,23 +1833,19 @@ class MinimalPdfAnnotatorSettingTab extends PluginSettingTab {
     if (Platform.isMacOS) {
       new Setting(containerEl)
         .setName('Look up in the right-click menu')
-        .setDesc('Adds a button that shows the dictionary entry for the word you right-click, using your Mac\u2019s Look Up.')
+        .setDesc('Adds dictionary lookup in right-click menu.')
         .addToggle((toggle) => toggle.setValue(settings.lookUp).onChange((v) => save('lookUp', v)));
     }
 
     new Setting(containerEl)
       .setName('Remember each PDF\u2019s zoom level')
-      .setDesc(
-        'Reopen a PDF at the zoom you last read it at. Kept per device, since a comfortable ' +
-          'zoom depends on the screen, so it is not carried between machines.'
-      )
       .addToggle((toggle) => toggle.setValue(settings.rememberZoom).onChange((v) => save('rememberZoom', v)));
   }
 }
 
 /* ------------------------------------------------------------------ sidebar
 
-   The annotations sidebar, after Zotero's. One card per highlight or note on
+   The annotations sidebar. One card per highlight or note on
    the document in front of you: the highlighted words, and an "Add note" box
    under them. Clicking the words takes you to them in the document; clicking
    a highlight in the document puts you in its box here. Every change in either
@@ -2359,7 +2491,7 @@ class EpubView extends FileView {
     const hit = onSelection ? null : this.hitAt(e.clientX, e.clientY);
     if (onSelection) {
       const text = selection.toString();
-      buttons.push(...selectionButtons(plugin.selectionActions(doc, () => this.highlightSelection(doc), () => text)));
+      buttons.push(...selectionButtons(plugin.selectionActions(doc, (c) => this.highlightSelection(doc, c), () => text), plugin.menuColours()));
     } else if (hit && hit.kind === 'note') {
       if (!doc.readOnly) {
         add('sticky-note', 'Edit note', () => plugin.revealAnnotation(doc, hit.id, true));
@@ -2403,7 +2535,7 @@ class EpubView extends FileView {
     const frameBox = this.frame.getBoundingClientRect();
     this.plugin.selectionBar.show(
       selectionEnd(selection.getRangeAt(0), frameBox),
-      this.plugin.selectionActions(doc, () => this.highlightSelection(doc), () => selection.toString()),
+      this.plugin.selectionActions(doc, (c) => this.highlightSelection(doc, c), () => selection.toString()),
       this.containerEl.ownerDocument
     );
   }
@@ -2418,7 +2550,7 @@ class EpubView extends FileView {
 
   /* The selection as a highlight, snapped to whole words unless that is
      turned off. Returns its id. */
-  highlightSelection(doc) {
+  highlightSelection(doc, colour) {
     const win = this.frame.contentWindow;
     const selection = win.getSelection();
     if (!selection || selection.isCollapsed || !selection.rangeCount) return null;
@@ -2448,7 +2580,7 @@ class EpubView extends FileView {
       id: uuid(),
       text,
       note: '',
-      color: this.plugin.settings.highlightColor,
+      color: HEX_COLOR_RE.test(colour || '') ? colour : this.plugin.settings.highlightColor,
       createdAt: new Date().toISOString(),
       epub: { start, end },
     };
@@ -3188,8 +3320,8 @@ html.mpa-mode-active ::selection { background: color-mix(in srgb, var(--mpa-mode
 `;
 
 /* Hovering a link to another place in the same PDF, which is what a footnote
-   or endnote marker is, shows a picture of the place it leads to, as Zotero
-   does. A picture rather than extracted text: it shows the note as printed,
+   or endnote marker is, shows a picture of the place it leads to. A picture
+   rather than extracted text: it shows the note as printed,
    formulas and italics included, and there is no guessing where one note
    ends and the next begins. Clicking the preview, or the marker itself, goes
    there. Only links inside the document; a web link is left to the viewer. */
@@ -3352,8 +3484,8 @@ class FootnotePreview {
   }
 }
 
-/* The small bar that appears by a selection when highlight mode is off, as
-   Zotero's does: Highlight, Add note, Copy. Not a menu: it holds nothing up,
+/* The small bar that appears by a selection when highlight mode is off:
+   Highlight, Add note, Copy. Not a menu: it holds nothing up,
    and goes away by itself on a click elsewhere, a scroll or a key. Pressing
    one of its buttons does not take the selection away, since the press is
    kept from moving the focus. */
@@ -3367,14 +3499,19 @@ class SelectionBar {
      selection's last line, or the point right-clicked. buttons: a list of
      { icon, label, run }, or the actions of a selection. */
   show(anchor, buttons, doc) {
-    const list = Array.isArray(buttons) ? buttons : selectionButtons(buttons);
+    const list = Array.isArray(buttons) ? buttons : selectionButtons(buttons, this.plugin.menuColours());
     this.hide();
     const home = doc || document;
     const win = home.defaultView || window;
     const el = home.body.createDiv({ cls: 'mpa-selection-bar' });
-    const button = (icon, label, run) => {
+    const button = (icon, label, run, colour) => {
       const b = el.createEl('button', { cls: 'mpa-selection-button', attr: { 'aria-label': label } });
       setIcon(b.createSpan({ cls: 'mpa-selection-icon' }), icon);
+      /* A highlighter shows the colour it highlights in. */
+      if (colour) {
+        b.addClass('mpa-colour');
+        b.style.setProperty('--mpa-color', colour);
+      }
       b.addEventListener('mousedown', (e) => e.preventDefault());
       b.addEventListener('click', (e) => {
         e.preventDefault();
@@ -3386,7 +3523,7 @@ class SelectionBar {
         }
       });
     };
-    for (const b of list) button(b.icon, b.label, b.run);
+    for (const b of list) button(b.icon, b.label, b.run, b.colour);
     const at = placeBox(
       { left: anchor.right - el.offsetWidth / 2, top: anchor.top, bottom: anchor.bottom },
       { width: el.offsetWidth, height: el.offsetHeight },
@@ -3405,6 +3542,72 @@ class SelectionBar {
   contains(node) {
     return !!this.el && isNode(node) && this.el.contains(node);
   }
+}
+
+/* The highlight colours, made sound: hex colours only, none twice, and at
+   least one in the menu. Settings from before there was a palette carry
+   their one colour into the menu. */
+function normalisePalette(settings, defaults) {
+  const hex = (list) =>
+    Array.isArray(list) ? list.filter((c) => typeof c === 'string' && HEX_COLOR_RE.test(c)).map((c) => expandHex(c).toLowerCase()) : null;
+  let menu = hex(settings.menuColours);
+  let spare = hex(settings.spareColours);
+  if (!menu) {
+    menu = [HEX_COLOR_RE.test(settings.highlightColor || '') ? expandHex(settings.highlightColor).toLowerCase() : defaults.menuColours[0]];
+    spare = defaults.spareColours.filter((c) => !menu.includes(c));
+  }
+  const seen = new Set();
+  const once = (c) => !seen.has(c) && seen.add(c);
+  menu = menu.filter(once);
+  spare = (spare || []).filter(once);
+  if (!menu.length) menu = spare.length ? [spare.shift()] : [defaults.menuColours[0]];
+  return { menu, spare };
+}
+
+/* Moves a colour within or between the menu and the spares, as dragging it
+   does: `from` and `to` are { list: 'menu' | 'spare', index }, where a
+   `to` index counts the colours already there. Returns the new lists, or
+   null if the menu would be left empty. */
+function movePaletteColour(menu, spare, from, to) {
+  const lists = { menu: menu.slice(), spare: spare.slice() };
+  const source = lists[from.list];
+  if (!source || from.index < 0 || from.index >= source.length) return null;
+  const [colour] = source.splice(from.index, 1);
+  const target = lists[to.list];
+  if (!target) return null;
+  let index = to.index;
+  if (from.list === to.list && from.index < to.index) index--;
+  target.splice(Math.max(0, Math.min(index, target.length)), 0, colour);
+  if (!lists.menu.length) return null;
+  return lists;
+}
+
+/* A plain name for a colour, for a tooltip. */
+function colourName(hex) {
+  const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(expandHex(hex));
+  if (!m) return 'colour';
+  const [r, g, b] = m.slice(1).map((x) => parseInt(x, 16) / 255);
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  if (max - min < 0.08) return max > 0.85 ? 'white' : max < 0.2 ? 'black' : 'grey';
+  let h;
+  if (max === r) h = ((g - b) / (max - min)) % 6;
+  else if (max === g) h = (b - r) / (max - min) + 2;
+  else h = (r - g) / (max - min) + 4;
+  h = (h * 60 + 360) % 360;
+  if (h < 15 || h >= 345) return 'red';
+  if (h < 40) return 'orange';
+  if (h < 70) return 'yellow';
+  if (h < 170) return 'green';
+  if (h < 200) return 'turquoise';
+  if (h < 255) return 'blue';
+  if (h < 290) return 'purple';
+  return 'pink';
+}
+
+function expandHex(hex) {
+  const m = /^#([0-9a-f])([0-9a-f])([0-9a-f])$/i.exec(hex || '');
+  return m ? `#${m[1]}${m[1]}${m[2]}${m[2]}${m[3]}${m[3]}` : hex || '';
 }
 
 /* Element and node checks that hold in every window. Each window, pop-outs
@@ -3432,10 +3635,22 @@ function pointInRange(range, x, y) {
   );
 }
 
-/* The buttons for a selection: Highlight, Add note, Copy. */
-function selectionButtons(actions) {
+/* The buttons for a selection: a highlighter for each colour in the menu,
+   then Add note and Copy. One colour is just "Highlight"; with more, each
+   is named, "Highlight green". */
+function selectionButtons(actions, colours) {
   const out = [];
-  if (actions.highlight) out.push({ icon: 'highlighter', label: 'Highlight', run: actions.highlight });
+  const list = colours && colours.length ? colours : [null];
+  if (actions.highlight) {
+    for (const colour of list) {
+      out.push({
+        icon: 'highlighter',
+        label: list.length > 1 && colour ? `Highlight ${colourName(colour)}` : 'Highlight',
+        run: () => actions.highlight(colour),
+        colour,
+      });
+    }
+  }
   if (actions.note) out.push({ icon: 'sticky-note', label: 'Add note', run: actions.note });
   out.push({ icon: 'copy', label: 'Copy', run: actions.copy });
   return out;
@@ -3853,7 +4068,7 @@ class AnnotationsView extends ItemView {
     return quoteChanged;
   }
 
-  /* A note box saves as it is typed in, as Zotero's does, with no button.
+  /* A note box saves as it is typed in, with no button.
      Its undo keys step through the typing in pauses, like the rest of
      Obsidian, through a history of its own. Leaving the box files the whole
      edit as one step in the document's undo history. */
@@ -4192,9 +4407,9 @@ function pagePaddingBox(pageEl) {
    from the browser's own selection geometry. Those are two answers to the same
    question, and they disagreed by a glyph: a highlight would stretch over a
    full stop the stored text left out, or the text would carry one the
-   highlight did not cover. Zotero avoids this by keeping its own character
-   positions and taking both answers from one of them. This is the same idea,
-   measured through the DOM instead of through the PDF's font metrics. */
+   highlight did not cover. Keeping the characters' own positions, and taking
+   both answers from them, avoids that; here they are measured through the
+   DOM rather than through the PDF's font metrics. */
 
 /* The text nodes of one page's text layer that a range touches, plus one on
    either side. The margin matters because a boundary gets nudged below, and
@@ -4487,7 +4702,7 @@ function linesFromChars(chars, from, to) {
 /* A PDF's text layer carries no spaces between its spans, so where two spans
    sit apart on the page the gap between them was a space on the page too.
    Reading the text without putting those back ran words together: "in
-   theexperience of loneliness". Characters within one span are taken as they
+   theexperience of". Characters within one span are taken as they
    come, since the viewer stretches a span's letters apart and the gaps inside
    it say nothing. */
 function textOfChars(chars) {
@@ -5013,7 +5228,7 @@ function collapseWhitespace(s) {
   return s.replace(/\s+/g, ' ').trim();
 }
 
-module.exports = MinimalPdfAnnotatorPlugin;
+module.exports = FinallyAReaderPlugin;
 
 /**
  * @typedef {Object} DocState

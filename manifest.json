@@ -1,9 +1,9 @@
 {
-  "id": "minimal-pdf-annotator",
-  "name": "Minimal PDF annotator",
+  "id": "finally-a-reader",
+  "name": "Finally, A Reader",
   "version": "0.1.0",
   "minAppVersion": "1.5.0",
-  "description": "Highlight and annotate PDFs and EPUBs with a Zotero-like sidebar, and turn the annotations into a markdown note in one click.",
+  "description": "Read and annotate PDFs and EPUBs, no learning curve, sidebar annotation tracker, one click to turn annotations into a markdown file.",
   "author": "david-fcp",
   "authorUrl": "https://github.com/david-fcp",
   "isDesktopOnly": false

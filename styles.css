@@ -1,4 +1,4 @@
-/* Minimal PDF annotator.
+/* Finally, A Reader.
 
    Class prefix "mpa-". Geometry that has to come from script (a highlight's
    position on its page, the note box following the pointer) is passed in as
@@ -149,12 +149,12 @@
   outline: none;
 }
 
-/* The card in hand: a bold outline in the text colour, which goes when you
-   click anywhere else. */
+/* The card in hand: lifted a little, with a slightly firmer edge, rather than
+   outlined. It settles back when you click anywhere else. */
 .mpa-card.is-selected,
 .mpa-card:focus-visible {
-  border-color: var(--text-normal);
-  box-shadow: 0 0 0 1px var(--text-normal);
+  border-color: var(--background-modifier-border-hover);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.08), 0 0 0 1px var(--background-modifier-border-hover);
 }
 
 .mpa-card-head {
@@ -164,7 +164,7 @@
 }
 
 /* The highlighted words, with the highlight's own colour as a bar beside
-   them, as Zotero shows them. The note underneath runs the full width, so the
+   them. The note underneath runs the full width, so the
    words and the note never look alike. */
 .mpa-card-words {
   flex: 1;
@@ -325,6 +325,90 @@ body.mpa-mode-active .textLayer .highlight {
 
 body.mpa-mode-active .textLayer ::selection {
   background: color-mix(in srgb, var(--mpa-mode-color, #ffeb3b) 40%, transparent);
+}
+
+/* ----------------------------------------------------------- the palette */
+
+.mpa-palette-setting .setting-item-control {
+  flex-wrap: wrap;
+}
+
+.mpa-palette {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px;
+  border-radius: var(--radius-s);
+}
+
+.mpa-palette.is-drop-target {
+  background: var(--background-modifier-hover);
+}
+
+.mpa-swatch {
+  position: relative;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--mpa-color);
+  border: 1px solid var(--background-modifier-border);
+  cursor: grab;
+}
+
+.mpa-swatch.is-dragging {
+  opacity: 0.4;
+}
+
+/* The pickers are clicked from script; the swatch is what is seen. */
+.mpa-swatch-input {
+  position: absolute;
+  width: 0;
+  height: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.mpa-swatch-remove {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  display: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.mpa-swatch:hover .mpa-swatch-remove {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.mpa-swatch-remove svg {
+  width: 10px;
+  height: 10px;
+}
+
+.mpa-palette-line {
+  width: 2px;
+  height: 28px;
+  margin: 0 4px;
+  border-radius: 1px;
+  background: var(--text-faint);
+}
+
+.mpa-palette-add {
+  position: relative;
+}
+
+/* A highlighter in a bar shows its colour beneath it. */
+.mpa-selection-button.mpa-colour .mpa-selection-icon {
+  border-bottom: 3px solid var(--mpa-color);
+  border-radius: 1px;
 }
 
 /* -------------------------------------------------------- selection bar */

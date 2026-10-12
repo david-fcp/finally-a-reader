@@ -1,4 +1,4 @@
-/* Unit tests for Minimal PDF annotator's pure logic: page geometry, the
+/* Unit tests for Finally, A Reader's pure logic: page geometry, the
    character model behind a selection, the note made from the annotations,
    undo, the context menu, the sidebar's list and its search. Run with
    `node tests/test-markdown.js`; Obsidian is stubbed. */
@@ -76,6 +76,7 @@ m._compile(
     "annotationItems,compareOrder,findAnnotation,annotationTarget,flashing,flashElapsed,pdfInnerOf,AnnotationsView," +
     "searchWords,wordMatches,editDistance,matchesQuery,destPoint,footnoteRegion," +
     "resolveBookPath,drmProtected,snapOffset,findQuote,validTextSize,readZip,uprightPage,findQuoteAcross,scopeCss,cssRules,scopeSelectorList," +
+    "normalisePalette,movePaletteColour,colourName,selectionButtons," +
     "validZoom,pdfViewerOf,pruneZooms,placeBox,clampToViewport};\n",
   P
 );
@@ -529,8 +530,8 @@ eq(
    together, tiny and out in the margin, drawn last in the content stream. */
 const body = (top) => ({ left: 60, top, width: 480, height: 12, text: "body" });
 const stamp = [
-  { left: 5, top: 10, width: 30, height: 4, text: "777309" },
-  { left: 5, top: 16, width: 40, height: 3, text: "research-article 2018" },
+  { left: 5, top: 10, width: 30, height: 4, text: "123456" },
+  { left: 5, top: 16, width: 40, height: 3, text: "article 2020" },
 ];
 eq("a stamp of two small lines in the corner goes",
   T.dropRunningHeads([body(600), body(614), body(628), ...stamp]).map((l) => l.text), ["body", "body", "body"]);
@@ -2200,6 +2201,32 @@ console.log("\n--- clampToViewport");
     eq("layer order statements stay shared", flat(T.scopeCss("@layer a, b; p{x:1}", "#mpa0")), "@layer a, b; @scope (#mpa0) { p{x:1} }");
     eq("a stylesheet of nothing but fonts stays as it is", flat(T.scopeCss("@font-face { a: b }", "#mpa0")), "@font-face { a: b }");
   }
+  console.log("\n--- highlight colours");
+  {
+    const defaults = { menuColours: ["#ffeb3b"], spareColours: ["#a8e6a1", "#9fd3ff"] };
+    eq("a new install: yellow in the menu, green and blue spare", T.normalisePalette({}, defaults), { menu: ["#ffeb3b"], spare: ["#a8e6a1", "#9fd3ff"] });
+    eq("settings from before the palette keep their colour, in the menu", T.normalisePalette({ highlightColor: "#FF0000" }, defaults), { menu: ["#ff0000"], spare: ["#a8e6a1", "#9fd3ff"] });
+    eq("a colour that is already a spare is not offered twice", T.normalisePalette({ highlightColor: "#a8e6a1" }, defaults), { menu: ["#a8e6a1"], spare: ["#9fd3ff"] });
+    eq("nonsense is dropped", T.normalisePalette({ menuColours: ["#ffeb3b", "red", 4], spareColours: ["#00ff00", "#00FF00"] }, defaults), { menu: ["#ffeb3b"], spare: ["#00ff00"] });
+    eq("short colour codes count as their long form, so none is taken twice", T.normalisePalette({ menuColours: ["#ABC"], spareColours: ["#aabbcc", "#9fd3ff"] }, defaults), { menu: ["#aabbcc"], spare: ["#9fd3ff"] });
+    eq("an empty menu takes the first spare", T.normalisePalette({ menuColours: [], spareColours: ["#00ff00", "#0000ff"] }, defaults), { menu: ["#00ff00"], spare: ["#0000ff"] });
+
+    const menu = ["#ffeb3b"], spare = ["#a8e6a1", "#9fd3ff"];
+    eq("dragging a spare across the line puts it in the menu", T.movePaletteColour(menu, spare, { list: "spare", index: 0 }, { list: "menu", index: 1 }), { menu: ["#ffeb3b", "#a8e6a1"], spare: ["#9fd3ff"] });
+    eq("to the front, it becomes highlight mode's colour", T.movePaletteColour(menu, spare, { list: "spare", index: 1 }, { list: "menu", index: 0 }), { menu: ["#9fd3ff", "#ffeb3b"], spare: ["#a8e6a1"] });
+    eq("reordering within the menu", T.movePaletteColour(["#a", "#b", "#c"].map((x) => x + "aaaaa"), [], { list: "menu", index: 0 }, { list: "menu", index: 3 }), { menu: ["#baaaaa", "#caaaaa", "#aaaaaa"], spare: [] });
+    eq("the last colour in the menu cannot be dragged out", T.movePaletteColour(menu, spare, { list: "menu", index: 0 }, { list: "spare", index: 0 }), null);
+    eq("one of several can", T.movePaletteColour(["#ffeb3b", "#a8e6a1"], ["#9fd3ff"], { list: "menu", index: 1 }, { list: "spare", index: 1 }), { menu: ["#ffeb3b"], spare: ["#9fd3ff", "#a8e6a1"] });
+
+    eq("colours have plain names", ["#ffeb3b", "#a8e6a1", "#9fd3ff", "#ff6666", "#d1b3ff", "#f8b4d0", "#ffcc80", "#888888"].map(T.colourName),
+      ["yellow", "green", "blue", "red", "purple", "pink", "orange", "grey"]);
+    eq("one colour in the menu: a plain Highlight button", T.selectionButtons({ highlight: () => {}, note: null, copy: () => {} }, ["#ffeb3b"]).map((b) => b.label), ["Highlight", "Copy"]);
+    eq("several: each is named", T.selectionButtons({ highlight: () => {}, note: () => {}, copy: () => {} }, ["#ffeb3b", "#a8e6a1"]).map((b) => b.label), ["Highlight yellow", "Highlight green", "Add note", "Copy"]);
+    let used = null;
+    T.selectionButtons({ highlight: (c) => (used = c), copy: () => {} }, ["#ffeb3b", "#a8e6a1"])[1].run();
+    eq("and highlights in its own colour", used, "#a8e6a1");
+  }
+
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })();

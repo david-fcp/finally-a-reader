@@ -11,15 +11,14 @@ put them before the pointer was consulted. It is no longer a command; run it
 from the developer console (Cmd+Option+I) with the problem text selected:
 
 ```js
-app.plugins.plugins['minimal-pdf-annotator'].writeSelectionReport()
+app.plugins.plugins['finally-a-reader'].writeSelectionReport()
 ```
 
-It writes `Minimal PDF annotator selection report.md` at the vault root.
+It writes `Finally, A Reader selection report.md` at the vault root.
 
 ## 1. One sentence lost its last letter: no longer happens
 
-The first sentence of the loneliness paper (`Loneliness in australian
-men.pdf`) used to lose its final letter: "lonelines" for "loneliness". On 11
+A sentence of a test PDF used to lose its final letter: "lonelines" for "loneliness". On 11
 October it could not be made to happen. Drags ending at five different points
 on the last letter all kept the whole word. It was probably fixed along the
 way by the changes to how a selection's ends are measured. If it comes back, a
@@ -50,8 +49,7 @@ unit tests cover it, and the window could not reproduce the original failure.
 ## 4. A selection across a page break took a publisher's stamp: fixed
 
 A PDF can draw text at any point in its content stream, not where it appears
-on the page. The loneliness paper draws a production stamp, "777309
-research-article 2018", tiny in page 1's top-left corner and last of all, so a
+on the page. The test PDF draws a production stamp in a top-left corner and last of all, so a
 selection running off the bottom of page 1 swept it in. A small group of lines
 standing apart from the rest of what was selected is now dropped when every
 line in it is either far smaller than the body text or lies outside the body
@@ -60,7 +58,7 @@ two-column papers are unaffected. The window test that used to report this as
 a known issue now checks it.
 
 A running header at the top of the next page can still be swept in when it is
-ordinary-sized text above the body, as it can be in Zotero. A line standing
+ordinary-sized text above the body. A line standing
 entirely on its own is dropped, as before.
 
 ## Other limitations

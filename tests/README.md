@@ -12,7 +12,7 @@ before compiling. If you add a function you want to test, add it to that list.
 
 ## What this is protecting
 
-**`test-markdown.js`** holds every unit test. The name is historical.
+**`test-markdown.js`** holds every unit test. 
 
 `renderExport()` is the note the sidebar's note button makes. The tests cover
 reading order, each of the layout settings and how they combine (a blank line
@@ -111,13 +111,3 @@ For EPUBs: `readZip()` against a real zip, paths inside a book,
 `drmProtected()` (font obfuscation is not DRM), `snapOffset()`,
 `findQuote()` for a highlight whose place in a changed book has moved, and the
 name of a book's annotations file.
-
-## The window suite
-
-Everything that needs a document on screen is covered by a second suite that
-drives a real Obsidian window through Obsidian's command line, with real mouse
-and key events: highlighting to the pixel in PDFs and EPUBs, undo keys, the
-sidebar, search, the note button, footnote previews, text size, and the
-refusal messages for DRM and fixed-layout books. It needs a test vault and a
-window on screen, so it lives outside this repository, beside the vault it
-was developed in.
