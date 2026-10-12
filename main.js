@@ -95,6 +95,10 @@ class FinallyAReaderPlugin extends Plugin {
        each keep their own copy of the data. */
     /** @type {Map<string, DocState>} */
     this.docs = new Map();
+    /* Annotations files on their way to a renamed document's new name. */
+    this.renaming = new Map();
+    /* Documents whose annotations could not follow a rename: their old file. */
+    this.leftBehind = new Map();
     /* Per open leaf: the DOM it owns. Keyed by the view object itself rather
        than by path, for the same reason. */
     /** @type {Map<object, ViewState>} */
@@ -182,6 +186,14 @@ class FinallyAReaderPlugin extends Plugin {
         }
       })
     );
+    /* A document renamed or moved takes its annotations with it. */
+    this.registerEvent(
+      this.app.vault.on('rename', (file, oldPath) => {
+        if (file instanceof TFile) {
+          this.followRename(file, oldPath).catch((e) => this.report('could not move the annotations of a renamed file', e));
+        }
+      })
+    );
 
     this.registerEvent(this.app.workspace.on('layout-change', () => this.scheduleSync()));
     this.registerEvent(this.app.workspace.on('active-leaf-change', () => {
@@ -243,6 +255,7 @@ class FinallyAReaderPlugin extends Plugin {
   }
 
   onunload() {
+    if (this.syncTimer) window.clearTimeout(this.syncTimer);
     /* A place in a book noted in the last second is kept. */
     if (this.places) this.writePlaces();
     if (this.footnotes) this.footnotes.hide();
@@ -423,13 +436,11 @@ class FinallyAReaderPlugin extends Plugin {
      and shows none of its highlights. */
   scheduleSync() {
     this.syncViews();
-    if (this.syncQueued) return;
-    this.syncQueued = true;
-    const timer = window.setTimeout(() => {
-      this.syncQueued = false;
+    if (this.syncTimer) return;
+    this.syncTimer = window.setTimeout(() => {
+      this.syncTimer = null;
       this.syncViews();
     }, 100);
-    this.register(() => window.clearTimeout(timer));
   }
 
   /* Picks up PDF leaves that have appeared and lets go of the ones that have
@@ -567,19 +578,102 @@ class FinallyAReaderPlugin extends Plugin {
 
   /* ------------------------------------------------------ paths and the IO */
 
-  /* "paper.pdf" keeps its annotations in "paper.annotations.json". A book
-     keeps its own in "book.epub.annotations.json", so that a PDF and an EPUB
-     of the same name in the same folder cannot share one. */
   getSidecarPath(file) {
-    if (/\.epub$/i.test(file.path)) return `${file.path}.annotations.json`;
-    return file.path.replace(/\.pdf$/i, '') + '.annotations.json';
+    return sidecarPathFor(file.path);
+  }
+
+  /* After a document is renamed or moved: its annotations, and what is
+     remembered about it on this device, follow it. A document not open this
+     session has only its file to move; an open one moves it through its save
+     queue, so no save in flight writes to either name halfway through. */
+  async followRename(file, oldPath) {
+    if (!/\.(pdf|epub)$/i.test(oldPath) && !/\.(pdf|epub)$/i.test(file.path)) return;
+    for (const [store, save] of [
+      [this.zooms, () => this.saveZooms()],
+      [this.textSizes, () => this.app.saveLocalStorage(TEXT_SIZE_STORE_KEY, this.textSizes)],
+      [this.places, () => this.savePlaces()],
+    ]) {
+      if (!store || !(oldPath in store)) continue;
+      store[file.path] = store[oldPath];
+      delete store[oldPath];
+      try {
+        save();
+      } catch (e) {
+        this.report('could not save what is remembered about a renamed file', e);
+      }
+    }
+    const doc = this.docs.get(oldPath);
+    if (doc) {
+      this.docs.delete(oldPath);
+      this.docs.set(file.path, doc);
+      doc.saveChain = doc.saveChain.then(() => this.moveSidecar(doc)).catch((e) => this.report('could not move annotations', e));
+      return doc.saveChain;
+    }
+    /* Opening the document under its new name waits for this, so it does
+       not start afresh from a file that has not arrived yet. */
+    const from = this.leftBehind.get(oldPath) || sidecarPathFor(oldPath);
+    this.leftBehind.delete(oldPath);
+    const moving = this.moveSidecarFile(from, sidecarPathFor(file.path));
+    this.renaming.set(file.path, moving);
+    try {
+      /* Not moved: the annotations stay where they are, and are used from
+         there, for the rest of the session. */
+      if (!(await moving)) this.leftBehind.set(file.path, from);
+    } finally {
+      if (this.renaming.get(file.path) === moving) this.renaming.delete(file.path);
+    }
+  }
+
+  /* Brings an open document's annotations file to where its name now says,
+     if it is not there already. */
+  async moveSidecar(doc) {
+    const to = this.getSidecarPath(doc.file);
+    /* Already moved, or already found blocked: asked once, not at every save. */
+    if (doc.sidecarPath === to || doc.sidecarBlocked === to) return;
+    if (await this.moveSidecarFile(doc.sidecarPath, to)) doc.sidecarPath = to;
+    else doc.sidecarBlocked = to;
+  }
+
+  /* Moves an annotations file. A file already at the new name is someone's
+     annotations too, so it is not written over: the old file stays where it
+     is and is still used, and the reader is told. Returns whether the
+     document's annotations now live at the new name. */
+  async moveSidecarFile(from, to) {
+    if (!from || from === to) return true;
+    const vault = this.app.vault;
+    const old = vault.getAbstractFileByPath(from);
+    /* Nothing at the old name: nothing to move, perhaps because a whole
+       folder was moved and it went along. */
+    if (!(old instanceof TFile)) return true;
+    /* A change of capitals only: on most Macs and PCs the disk sees one name,
+       so the file "already there" is this one. */
+    const sameName = from.toLowerCase() === to.toLowerCase();
+    if (!sameName && (vault.getAbstractFileByPath(to) || (await vault.adapter.exists(to)))) {
+      new Notice(
+        `The annotations stay in ${from} for now, because ${to} already exists. ` +
+          `To bring them along, move or delete ${to}, then rename the document once more.`,
+        15000
+      );
+      return false;
+    }
+    await vault.rename(old, to);
+    return true;
   }
 
   async loadDoc(file) {
-    const existing = this.docs.get(file.path);
+    const existing = this.docs.get(file.path) || this.rekeyDoc(file);
     if (existing) return existing;
-
-    const loaded = await this.readSidecar(file);
+    /* Read again if the document was renamed while it was being read. */
+    let path;
+    let loaded;
+    for (let tries = 0; tries < 3; tries++) {
+      const moving = this.renaming.get(file.path);
+      if (moving) await moving.catch(() => null);
+      path = this.leftBehind.get(file.path) || this.getSidecarPath(file);
+      loaded = await this.readSidecar(path);
+      const now = this.leftBehind.get(file.path) || this.getSidecarPath(file);
+      if (now === path && !this.renaming.has(file.path)) break;
+    }
     /* A second caller may have finished first while this one was reading. */
     const raced = this.docs.get(file.path);
     if (raced) return raced;
@@ -587,6 +681,11 @@ class FinallyAReaderPlugin extends Plugin {
     /** @type {DocState} */
     const doc = {
       file,
+      /* Where the annotations file is, which a rename can leave behind
+         the document's own name for a moment. */
+      sidecarPath: path,
+      /* Left behind by a rename that could not move it: not tried again. */
+      sidecarBlocked: path === this.getSidecarPath(file) ? null : this.getSidecarPath(file),
       data: loaded.data,
       readOnly: !loaded.ok,
       saveChain: Promise.resolve(),
@@ -598,13 +697,27 @@ class FinallyAReaderPlugin extends Plugin {
       /* A note being typed in the sidebar, not yet filed as an undo step. */
       editing: false,
       saveTimer: null,
+      /* Counts changes, so a page whose annotations are already drawn as they
+         stand is left alone when the viewer redraws around it. */
+      revision: 0,
     };
     this.docs.set(file.path, doc);
     return doc;
   }
 
-  async readSidecar(pdfFile) {
-    const path = this.getSidecarPath(pdfFile);
+  /* A document already loaded under another name: a folder it was in was
+     renamed, which can arrive without a rename of the file itself. */
+  rekeyDoc(file) {
+    for (const [path, doc] of this.docs) {
+      if (doc.file !== file) continue;
+      this.docs.delete(path);
+      this.docs.set(file.path, doc);
+      return doc;
+    }
+    return null;
+  }
+
+  async readSidecar(path) {
     const file = this.app.vault.getAbstractFileByPath(path);
     const empty = { highlights: [], notes: [] };
     if (!(file instanceof TFile)) return { data: empty, ok: true };
@@ -620,14 +733,7 @@ class FinallyAReaderPlugin extends Plugin {
     }
     try {
       const parsed = JSON.parse(text);
-      const highlights = Array.isArray(parsed.highlights) ? parsed.highlights : [];
-      return {
-        ok: true,
-        data: {
-          highlights: highlights.map(migrateHighlight),
-          notes: Array.isArray(parsed.notes) ? parsed.notes : [],
-        },
-      };
+      return { ok: true, data: sanitiseAnnotations(parsed) };
     } catch (e) {
       /* Carrying on with empty data would present as "annotations lost" and
          then overwrite the damaged file with nothing. The PDF opens read-only
@@ -655,7 +761,15 @@ class FinallyAReaderPlugin extends Plugin {
   }
 
   async save(doc) {
-    const path = this.getSidecarPath(doc.file);
+    /* A move that fails leaves the annotations where they were; the change
+       is still saved, there. */
+    try {
+      await this.moveSidecar(doc);
+    } catch (e) {
+      this.report('could not move annotations to follow a renamed file', e);
+      doc.sidecarBlocked = this.getSidecarPath(doc.file);
+    }
+    const path = doc.sidecarPath;
     const content = JSON.stringify(doc.data, null, 2) + '\n';
     /* Recorded before the write, not after. The vault's change event can
        arrive while the write is still being awaited, and reloadSidecar would
@@ -993,6 +1107,7 @@ class FinallyAReaderPlugin extends Plugin {
     while (doc.undoStack.length > UNDO_LIMIT) doc.undoStack.shift();
     doc.redoStack.length = 0;
     doc.baseline = snapshot(doc.data);
+    doc.revision++;
 
     if (doc.saveTimer) {
       window.clearTimeout(doc.saveTimer);
@@ -1031,6 +1146,7 @@ class FinallyAReaderPlugin extends Plugin {
     doc.data.highlights = entry.state.highlights;
     doc.data.notes = entry.state.notes;
     doc.baseline = snapshot(doc.data);
+    doc.revision++;
 
     this.queueSave(doc);
     for (const state of this.views.values()) {
@@ -1053,7 +1169,7 @@ class FinallyAReaderPlugin extends Plugin {
      write our old idea of the file over somebody else's newer one. */
   async reloadSidecar(file) {
     for (const doc of this.docs.values()) {
-      if (file.path !== this.getSidecarPath(doc.file)) continue;
+      if (file.path !== doc.sidecarPath) continue;
       let raw;
       try {
         raw = await this.app.vault.read(file);
@@ -1062,13 +1178,14 @@ class FinallyAReaderPlugin extends Plugin {
       }
       if (stamp(raw) === doc.sidecarStamp) return; // our own write coming back
 
-      const loaded = await this.readSidecar(doc.file);
+      const loaded = await this.readSidecar(doc.sidecarPath);
       doc.data = loaded.data;
       doc.readOnly = !loaded.ok;
       doc.sidecarStamp = stamp(raw);
       doc.baseline = snapshot(doc.data);
       doc.undoStack.length = 0;
       doc.redoStack.length = 0;
+      doc.revision++;
       for (const state of this.views.values()) {
         if (state.doc === doc) this.render(state);
       }
@@ -1081,7 +1198,16 @@ class FinallyAReaderPlugin extends Plugin {
 
   addHighlightsFromSelection(state, colour) {
     const selection = windowOf(state.container).getSelection();
-    if (!selection || selection.isCollapsed || selection.rangeCount === 0) return;
+    if (!selection) return;
+    /* A drag begun exactly on the seam between two runs of a PDF's text can
+       leave the browser with no selection at all. The drag itself still says
+       what was meant, so it is used instead. */
+    if (selection.isCollapsed || selection.rangeCount === 0) {
+      const dragged = dragRange(state.container.ownerDocument, this.pointers.down, this.pointers.up);
+      if (!dragged || !state.container.contains(dragged.commonAncestorContainer)) return;
+      selection.removeAllRanges();
+      selection.addRange(dragged);
+    }
     const range = selection.getRangeAt(0);
 
     /* The pages the selection actually touches, in document order. */
@@ -1379,8 +1505,6 @@ class FinallyAReaderPlugin extends Plugin {
     if (state.kind === 'epub') {
       if (!state.container.isShown()) this.app.workspace.revealLeaf(state.view.leaf);
       if (!state.view.goTo(id)) return false;
-      state.flash = { id, since: Date.now(), until: Date.now() + FLASH_MS };
-      state.view.redraw();
       return true;
     }
     const target = annotationTarget(doc.data, id);
@@ -1397,8 +1521,6 @@ class FinallyAReaderPlugin extends Plugin {
     } else {
       inner.currentPageNumber = target.page;
     }
-    state.flash = { id, since: Date.now(), until: Date.now() + FLASH_MS };
-    this.scheduleRedraw(state);
     return true;
   }
 
@@ -1409,10 +1531,16 @@ class FinallyAReaderPlugin extends Plugin {
     if (!doc || doc.readOnly) return;
     const found = findAnnotation(doc.data, id);
     if (!found) return;
+    /* The page only changes when a highlight's note marker appears or goes;
+       a note of its own is marked whatever it says. */
+    const before = found.kind === 'highlight' ? found.obj.note || '' : null;
     if (found.kind === 'highlight') found.obj.note = text;
     else found.obj.text = text;
     doc.editing = true;
     this.saveSoon(doc);
+    const marked = (note) => [!!note, !!note.trim()].join();
+    if (before === null || marked(before) === marked(text)) return;
+    doc.revision++;
     for (const state of this.views.values()) {
       if (state.doc === doc) this.scheduleRedraw(state);
     }
@@ -1531,6 +1659,10 @@ class FinallyAReaderPlugin extends Plugin {
       });
     }
 
+    /* Positions are fractions of the page, so a layer drawn for these
+       annotations is right at any zoom, and only a page the viewer has
+       rebuilt, which takes the layer with it, needs drawing again. */
+    const key = `${state.doc.revision}:${this.drawRevision || 0}`;
     for (const pageEl of state.container.querySelectorAll('.page')) {
       const items = byPage.get(pageNumberOf(pageEl));
       let layer = pageEl.querySelector(':scope > .mpa-layer');
@@ -1539,8 +1671,10 @@ class FinallyAReaderPlugin extends Plugin {
         if (layer) layer.remove();
         continue;
       }
+      if (layer && layer.dataset.mpaKey === key) continue;
       if (!layer) layer = pageEl.createDiv({ cls: 'mpa-layer' });
       layer.empty();
+      layer.dataset.mpaKey = key;
 
       for (const { highlight, rect, color } of items.rects) {
         const el = layer.createDiv({ cls: 'mpa-highlight' });
@@ -1550,7 +1684,6 @@ class FinallyAReaderPlugin extends Plugin {
         el.style.setProperty('--mpa-w', pct(rect.w));
         el.style.setProperty('--mpa-h', pct(rect.h));
         el.style.setProperty('--mpa-color', color);
-        markFlash(el, state, highlight.id);
       }
 
       for (const item of items.icons) {
@@ -1558,7 +1691,6 @@ class FinallyAReaderPlugin extends Plugin {
            is in the stylesheet, so there is one rule for every marker. */
         const icon = this.createNoteIcon(layer, item.id, item.kind, item.color);
         icon.style.setProperty('--mpa-y', pct(item.y));
-        if (item.kind === 'note') markFlash(icon, state, item.id);
       }
     }
   }
@@ -1632,6 +1764,8 @@ class FinallyAReaderPlugin extends Plugin {
 
   async saveSettings() {
     await this.saveData(this.settings);
+    /* Colours may have changed: every page is drawn again. */
+    this.drawRevision = (this.drawRevision || 0) + 1;
     this.applyModeColor();
     this.updateStatusEl();
     for (const state of this.views.values()) this.render(state);
@@ -1919,7 +2053,7 @@ class EpubView extends FileView {
 
   async onLoadFile(file) {
     const token = ++this.loadToken;
-    this.close();
+    this.releaseBook();
     this.contentEl.empty();
     this.contentEl.addClass('mpa-epub');
     let book;
@@ -1948,16 +2082,18 @@ class EpubView extends FileView {
   async onUnloadFile() {
     this.loadToken++;
     this.plugin.detachEpub(this);
-    this.close();
+    this.releaseBook();
   }
 
   async onClose() {
     this.loadToken++;
     this.plugin.detachEpub(this);
-    this.close();
+    this.releaseBook();
   }
 
-  close() {
+  /* Lets go of the book shown. Not named close(): that is the view's own,
+     which Obsidian calls to unload it when its tab is closed. */
+  releaseBook() {
     this.hidePreview();
     if (this.resizeObserver) this.resizeObserver.disconnect();
     this.resizeObserver = null;
@@ -1991,7 +2127,7 @@ class EpubView extends FileView {
     frame.srcdoc =
       '<!DOCTYPE html><html><head><meta charset="utf-8">' +
       '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; img-src blob: data:; ' +
-      'font-src blob: data:; media-src blob: data:; style-src \'unsafe-inline\'">' +
+      'font-src blob: data:; media-src blob: data:; style-src \'unsafe-inline\'; form-action \'none\'; base-uri \'none\'">' +
       '</head><body></body></html>';
     await new Promise((resolve) => frame.addEventListener('load', resolve, { once: true }));
     this.frame = frame;
@@ -2248,7 +2384,6 @@ class EpubView extends FileView {
       el.style.setProperty('--mpa-y', px(top));
       el.style.setProperty('--mpa-color', color);
       el.innerHTML = NOTE_ICON_SVG;
-      markFrameFlash(el, state, id);
       layer.appendChild(el);
     };
 
@@ -2273,7 +2408,6 @@ class EpubView extends FileView {
         el.style.setProperty('--mpa-w', px(r.width));
         el.style.setProperty('--mpa-h', px(r.height));
         el.style.setProperty('--mpa-color', color);
-        markFrameFlash(el, state, h.id);
         layer.appendChild(el);
       }
       if (h.note && h.note.trim()) icon(h.id, 'highlight', rects[0].top + rects[0].height / 2, color);
@@ -2723,13 +2857,6 @@ function lineRects(rectList) {
   return lines.map((l) => ({ left: l.left, top: l.top, width: l.right - l.left, height: l.bottom - l.top }));
 }
 
-function markFrameFlash(el, state, id) {
-  const elapsed = flashElapsed(state, id);
-  if (elapsed === null) return;
-  el.style.setProperty('--mpa-flash-delay', `-${elapsed}ms`);
-  el.classList.add('mpa-flash');
-}
-
 /* Moves an offset in a chapter's text to the edge of the word it falls in,
    and off any spaces, so a highlight starts and ends on words. With
    snapping off, only the spaces are trimmed. */
@@ -2804,6 +2931,11 @@ function validTextSize(value) {
 
 /* ------------------------------------------------------- reading the file */
 
+/* The most one file inside a book, and the whole book, may unpack to. Far
+   beyond any real book; a limit only for files built to be one. */
+const ZIP_ENTRY_LIMIT = 64 * 1024 * 1024;
+const ZIP_TOTAL_LIMIT = 512 * 1024 * 1024;
+
 /* The files inside a zip, from its central directory. Only what an EPUB
    uses: stored or deflated entries, no encryption, no zip64. */
 function readZip(buffer) {
@@ -2836,6 +2968,7 @@ function readZip(buffer) {
     at += 46 + nameLength + extraLength + commentLength;
   }
 
+  let unpacked = 0;
   async function read(name) {
     const entry = entries.get(name);
     if (!entry) return null;
@@ -2846,8 +2979,29 @@ function readZip(buffer) {
     const data = bytes.subarray(start, start + entry.packed);
     if (entry.method === 0) return data.slice();
     if (entry.method !== 8) throw new Error(`${name} uses an unsupported compression`);
-    const stream = new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
-    return new Uint8Array(await new Response(stream).arrayBuffer());
+    /* Unpacked a piece at a time and stopped at a limit, so a file made to
+       unpack to far more than it holds cannot use up the memory. */
+    const reader = new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate-raw')).getReader();
+    const chunks = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.length;
+      unpacked += value.length;
+      if (total > ZIP_ENTRY_LIMIT || unpacked > ZIP_TOTAL_LIMIT) {
+        reader.cancel().catch(() => null);
+        throw new Error(`${name} unpacks to more than a book can hold`);
+      }
+      chunks.push(value);
+    }
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      out.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return out;
   }
 
   return {
@@ -3293,15 +3447,6 @@ const EPUB_FRAME_CSS = `
 }
 .mpa-note-icon svg { width: 14px; height: 14px; fill: var(--mpa-color, #ffeb3b); stroke: #333; stroke-width: 1.4; }
 html.mpa-mode-active ::selection { background: color-mix(in srgb, var(--mpa-mode-color, #ffeb3b) 55%, transparent); }
-@keyframes mpa-flash {
-  0%, 50%, 100% { box-shadow: 0 0 0 0 transparent; }
-  25%, 75% { box-shadow: 0 0 0 3px var(--mpa-color, #2878c8); }
-}
-.mpa-highlight.mpa-flash, .mpa-note-icon.mpa-flash {
-  animation: mpa-flash 1.2s ease-in-out;
-  animation-delay: var(--mpa-flash-delay, 0s);
-  animation-fill-mode: both;
-}
 .mpa-epub-footnote {
   position: fixed;
   z-index: 10;
@@ -3709,6 +3854,38 @@ function wordRangeAt(doc, x, y) {
   range.setStart(startNode, start);
   range.setEnd(endNode, end);
   return range;
+}
+
+/* The text between where a drag began and where it ended, for a drag that
+   left no selection. Our own highlight boxes are let through, so the text
+   beneath one is found. Null for a click, or where either end is not text. */
+function dragRange(doc, down, up) {
+  if (!down || !up || Math.hypot(up.x - down.x, up.y - down.y) < 4) return null;
+  doc.body.classList.add('mpa-hit-through');
+  let a;
+  let b;
+  try {
+    a = caretRangeAt(doc, down.x, down.y);
+    b = caretRangeAt(doc, up.x, up.y);
+  } finally {
+    doc.body.classList.remove('mpa-hit-through');
+  }
+  if (!a || !b || a.startContainer.nodeType !== 3 || b.startContainer.nodeType !== 3) return null;
+  /* Both ends on text, or within a few pixels of it: a drag begun out in a
+     margin or between paragraphs still makes nothing. */
+  const onText = (caret, point) => {
+    const el = caret.startContainer.parentElement;
+    const box = el && el.closest('.textLayer') ? el.getBoundingClientRect() : null;
+    const slack = 4;
+    return !!box && point.x >= box.left - slack && point.x <= box.right + slack && point.y >= box.top - slack && point.y <= box.bottom + slack;
+  };
+  if (!onText(a, down) || !onText(b, up)) return null;
+  const forward = a.compareBoundaryPoints(a.START_TO_START, b) <= 0;
+  const [first, last] = forward ? [a, b] : [b, a];
+  const range = doc.createRange();
+  range.setStart(first.startContainer, first.startOffset);
+  range.setEnd(last.startContainer, last.startOffset);
+  return range.collapsed ? null : range;
 }
 
 /* The last line of a selection, ignoring the zero-sized and page-sized boxes
@@ -4839,6 +5016,39 @@ function dropRunningHeads(lines) {
   return drop.size ? lines.filter((line) => !drop.has(line)) : lines;
 }
 
+/* "paper.pdf" keeps its annotations in "paper.annotations.json"; a book
+   keeps its own in "book.epub.annotations.json", so that a PDF and an EPUB
+   of the same name in the same folder cannot share one. */
+function sidecarPathFor(path) {
+  if (/\.epub$/i.test(path)) return `${path}.annotations.json`;
+  return path.replace(/\.pdf$/i, '') + '.annotations.json';
+}
+
+/* An annotations file as read, made safe to work with: entries that are not
+   annotations at all are left out, every annotation has an id of its own, and
+   its words are text. A file edited by hand, or by another program, cannot
+   then stop the sidebar or the page from drawing. Anything else an entry
+   carries is kept as it is. */
+function sanitiseAnnotations(parsed) {
+  const seen = new Set();
+  const clean = (list) =>
+    (Array.isArray(list) ? list : [])
+      .filter((x) => x && typeof x === 'object' && !Array.isArray(x))
+      .map((x) => {
+        const out = Object.assign({}, x);
+        if (typeof out.id !== 'string' || !out.id || seen.has(out.id)) out.id = uuid();
+        seen.add(out.id);
+        for (const key of ['text', 'note']) {
+          if (out[key] !== undefined && typeof out[key] !== 'string') out[key] = out[key] === null ? '' : String(out[key]);
+        }
+        if (out.rects !== undefined && !Array.isArray(out.rects)) out.rects = [];
+        if (Array.isArray(out.rects)) out.rects = out.rects.filter((r) => r && typeof r === 'object');
+        return out;
+      });
+  const data = parsed && typeof parsed === 'object' ? parsed : {};
+  return { highlights: clean(data.highlights).map(migrateHighlight), notes: clean(data.notes) };
+}
+
 /* Highlights used to carry one page number for the whole annotation, which
    meant a selection crossing a page break had to be stored as two separate
    highlights and removed twice. Each rectangle now names its own page, so the
@@ -4970,30 +5180,6 @@ function annotationTarget(data, id) {
   }
   const p = found.obj.position || {};
   return { page: found.obj.page || 1, y: p.y || 0 };
-}
-
-/* How long an annotation is pointed out for after navigating to it, which is
-   also the length of the animation in styles.css. */
-const FLASH_MS = 1200;
-
-/* Whether an annotation is being pointed out after navigating to it. */
-function flashing(state, id) {
-  return !!(state.flash && state.flash.id === id && Date.now() < state.flash.until);
-}
-
-/* How far into its animation a pointed-out annotation is. The page redraws
-   several times while it scrolls into place, replacing these elements, and a
-   fresh element would otherwise start its animation again from the top. */
-function flashElapsed(state, id) {
-  if (!flashing(state, id)) return null;
-  return Math.max(0, Date.now() - (state.flash.since || Date.now()));
-}
-
-function markFlash(el, state, id) {
-  const elapsed = flashElapsed(state, id);
-  if (elapsed === null) return;
-  el.style.setProperty('--mpa-flash-delay', `-${elapsed}ms`);
-  el.addClass('mpa-flash');
 }
 
 /* The PDF.js viewer behind a PDF view, without the zoom check pdfViewerOf
@@ -5252,7 +5438,6 @@ module.exports = FinallyAReaderPlugin;
  * @property {MutationObserver | null} observer
  * @property {number} frame                   pending animation-frame redraw
  * @property {string | null} pendingZoom       a remembered zoom not yet applied
- * @property {{id: string, until: number}} [flash] an annotation being pointed out
  *
  * @typedef {Object} Card
  * @property {string} id

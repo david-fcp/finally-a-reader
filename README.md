@@ -61,8 +61,9 @@ extension stays in the name so that a PDF and an EPUB with the same name can't
 share one file.
 
 That file is plain JSON, so it
-syncs, diffs and backs up like anything else. Keep it next to its document when
-you move things around. If it is ever unreadable, the document opens with its
+syncs, diffs and backs up like anything else. Rename or move a document in
+Obsidian and its annotations file goes with it; outside Obsidian, in Finder or
+Explorer, move the two together. If it is ever unreadable, the document opens with its
 annotations read-only rather than starting over, so there is something left to
 recover.
 ## Licence

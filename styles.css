@@ -66,24 +66,6 @@
   stroke-width: 1.4;
 }
 
-/* ------------------------------------------------------- being pointed out */
-
-/* An annotation just navigated to, from its card in the sidebar, or a card
-   just navigated to, from the document. Two soft pulses, then gone. */
-@keyframes mpa-flash {
-  0%, 50%, 100% { box-shadow: 0 0 0 0 transparent; }
-  25%, 75% { box-shadow: 0 0 0 3px var(--mpa-color, var(--interactive-accent)); }
-}
-
-/* A negative delay, set from script, lets an element redrawn halfway through
-   carry on from where the last one was instead of starting again. */
-.mpa-highlight.mpa-flash,
-.mpa-note-icon.mpa-flash {
-  animation: mpa-flash 1.2s ease-in-out;
-  animation-delay: var(--mpa-flash-delay, 0s);
-  animation-fill-mode: both;
-}
-
 /* ----------------------------------------------------------------- sidebar */
 
 .mpa-sidebar {
@@ -190,9 +172,11 @@
   mask-image: linear-gradient(to bottom, #000 calc(100% - 1lh), transparent);
 }
 
+/* At the right, under the quote's last line; only the words are clickable. */
 .mpa-card-less {
   display: none;
-  padding-left: calc(var(--size-4-2) + 3px);
+  width: fit-content;
+  margin-left: auto;
   font-size: var(--font-ui-smaller);
   color: var(--text-muted);
   cursor: pointer;

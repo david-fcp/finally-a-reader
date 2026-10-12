@@ -73,11 +73,11 @@ m._compile(
     "measurable,cell,round,blank,charAt,describePoint,sameLine,boundaryPosition," +
     "indexOfBoundary,touchedBounds,refineBoundary,wordGapBetween,nearestPointer,isWordChar,insideWord," +
     "snapStart,snapEnd,selectedSlice,linesFromChars,textOfChars,snapshot,NoteHistory," +
-    "annotationItems,compareOrder,findAnnotation,annotationTarget,flashing,flashElapsed,pdfInnerOf,AnnotationsView," +
+    "annotationItems,compareOrder,findAnnotation,annotationTarget,pdfInnerOf,AnnotationsView," +
     "searchWords,wordMatches,editDistance,matchesQuery,destPoint,footnoteRegion," +
     "resolveBookPath,drmProtected,snapOffset,findQuote,validTextSize,readZip,uprightPage,findQuoteAcross,scopeCss,cssRules,scopeSelectorList," +
     "normalisePalette,movePaletteColour,colourName,selectionButtons," +
-    "validZoom,pdfViewerOf,pruneZooms,placeBox,clampToViewport};\n",
+    "validZoom,pdfViewerOf,pruneZooms,placeBox,clampToViewport,sanitiseAnnotations,sidecarPathFor};\n",
   P
 );
 const PluginClass = m.exports;
@@ -1809,15 +1809,6 @@ console.log("\n--- clampToViewport");
     eq("nor for a highlight with no rectangles", T.annotationTarget({ highlights: [hl("bare", [])], notes: [] }, "bare"), null);
   }
 
-  console.log("\n--- flashing");
-  {
-    const later = Date.now() + 10000;
-    eq("the annotation being pointed out", T.flashing({ flash: { id: "a", until: later } }, "a"), true);
-    eq("not another one", T.flashing({ flash: { id: "a", until: later } }, "b"), false);
-    eq("not once the moment has passed", T.flashing({ flash: { id: "a", until: Date.now() - 1 } }, "a"), false);
-    eq("nothing when nothing is", T.flashing({}, "a"), false);
-  }
-
   console.log("\n--- editing from the sidebar");
   {
     /* A note typed in the sidebar reaches the annotation as it is typed, is
@@ -1938,16 +1929,6 @@ console.log("\n--- clampToViewport");
     eq("only one sidebar is made", leaves.length, 1);
     eq("and both requests get it", one === two && !!one, true);
   }
-  {
-    /* A redrawn highlight carries on its flash from where it was. */
-    const start = Date.now() - 400;
-    const state = { flash: { id: "a", since: start, until: start + 1200 } };
-    const elapsed = T.flashElapsed(state, "a");
-    eq("partway through, it knows how far", elapsed >= 400 && elapsed < 1000, true);
-    eq("another annotation is not flashing", T.flashElapsed(state, "b"), null);
-    eq("nor is anything once it is over", T.flashElapsed({ flash: { id: "a", since: 0, until: 1 } }, "a"), null);
-  }
-
   console.log("\n--- searching annotations");
   {
     const q = (text, query) => T.matchesQuery(text, query);
@@ -2225,6 +2206,26 @@ console.log("\n--- clampToViewport");
     let used = null;
     T.selectionButtons({ highlight: (c) => (used = c), copy: () => {} }, ["#ffeb3b", "#a8e6a1"])[1].run();
     eq("and highlights in its own colour", used, "#a8e6a1");
+  }
+
+  console.log("\n--- annotations files as read");
+  {
+    eq("a PDF's annotations sit beside it, without its extension", T.sidecarPathFor("a/Paper.pdf"), "a/Paper.annotations.json");
+    eq("a book's keep its extension, so the two never share", T.sidecarPathFor("a/Paper.epub"), "a/Paper.epub.annotations.json");
+    const clean = T.sanitiseAnnotations({
+      highlights: [null, 4, "x", [1], { id: "a", text: 12, note: null, rects: [{ page: 1, x: 0, y: 0, w: 1, h: 1 }, null] }, { id: "a", text: "twin" }, { text: "no id" }],
+      notes: { not: "a list" },
+      extra: "kept elsewhere",
+    });
+    eq("entries that are not annotations are left out", clean.highlights.length, 3);
+    eq("words that are not text become text", [clean.highlights[0].text, clean.highlights[0].note], ["12", ""]);
+    eq("a rectangle that is not one is dropped", clean.highlights[0].rects.length, 1);
+    eq("an id used twice is given a new one the second time", clean.highlights[1].id !== "a" && typeof clean.highlights[1].id === "string", true);
+    eq("an annotation without an id gets one", typeof clean.highlights[2].id === "string" && clean.highlights[2].id.length > 0, true);
+    eq("notes that are not a list are no notes", clean.notes, []);
+    eq("a file that is not an object at all is empty", T.sanitiseAnnotations(null), { highlights: [], notes: [] });
+    const kept = T.sanitiseAnnotations({ highlights: [{ id: "k", text: "t", note: "", rects: [], mine: { a: 1 } }], notes: [] });
+    eq("anything else an annotation carries is kept", kept.highlights[0].mine, { a: 1 });
   }
 
   console.log(`\n${pass} passed, ${fail} failed`);

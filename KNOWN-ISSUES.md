@@ -61,7 +61,22 @@ A running header at the top of the next page can still be swept in when it is
 ordinary-sized text above the body. A line standing
 entirely on its own is dropped, as before.
 
+## 5. A drag begun on the seam between two runs of text made nothing: fixed
+
+At one exact point, a fraction of a pixel wide, where one run of a PDF's text
+ends and the next begins, the browser can make no selection at all for a drag
+begun there. With highlight mode on, the plugin now takes the drag's own two
+ends instead, as long as both are on text, so a drag out in a margin still
+makes nothing.
+
 ## Other limitations
+
+- **Renaming onto a name that already has annotations.** Rename a document to
+  a name whose annotations file is already there, left behind by another
+  document, and the annotations stay under the old name: neither file is
+  written over, and a notice says so. They are used from there until Obsidian
+  is restarted; after that, the document shows the other file's. Move or
+  delete the other file and rename the document once more to bring them along.
 
 - **Mobile** has been checked only in Obsidian's mobile emulation on a
   computer, not on a phone or tablet.
