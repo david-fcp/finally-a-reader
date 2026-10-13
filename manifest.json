@@ -1,9 +1,9 @@
 {
   "id": "finally-a-reader",
-  "name": "Finally, A Reader",
-  "version": "0.1.0",
-  "minAppVersion": "1.5.0",
-  "description": "Read and annotate PDFs and EPUBs, no learning curve, sidebar annotation tracker, one click to turn annotations into a markdown file.",
+  "name": "Finally A Reader",
+  "version": "0.1.1",
+  "minAppVersion": "1.14.4",
+  "description": "Read and annotate PDFs and EPUBs, no learning curve, sidebar annotation tracker, one click to turn annotations into a Markdown file.",
   "author": "david-fcp",
   "authorUrl": "https://github.com/david-fcp",
   "isDesktopOnly": false
