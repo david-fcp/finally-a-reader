@@ -12,9 +12,9 @@ notes.
 
 For me, this replaces both Zotero AND my clunky or invasive EPUB readers. Enjoy!
 
-![Highlighting a sentence, then adding a note to it in the sidebar](assets/highlight.gif)
+![Highlighting a sentence, then adding a note to it in the sidebar](https://raw.githubusercontent.com/david-fcp/finally-a-reader/main/assets/highlight.gif)
 
-![Making a markdown note of every annotation with one click](assets/note.gif)
+![Making a markdown note of every annotation with one click](https://raw.githubusercontent.com/david-fcp/finally-a-reader/main/assets/note.gif)
 
 # Other features 
 - Search your annotations in the sidebar 
