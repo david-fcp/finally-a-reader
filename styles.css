@@ -270,9 +270,11 @@
 
 /* -------------------------------------------------------------------- EPUB */
 
-.mpa-epub {
-  padding: 0 !important;
-  overflow: hidden !important;
+/* Named through the book's own tab, so it outranks the padding and
+   scrolling Obsidian gives every tab's content. */
+.workspace-leaf-content[data-type="mpa-epub"] > .view-content.mpa-epub {
+  padding: 0;
+  overflow: hidden;
 }
 
 .mpa-epub-frame {
@@ -399,7 +401,7 @@ body.mpa-mode-active .textLayer ::selection {
 
 /* Finding the word under a right-click looks through our highlight boxes. */
 body.mpa-hit-through .mpa-highlight {
-  pointer-events: none !important;
+  pointer-events: none;
 }
 
 .mpa-selection-bar {
